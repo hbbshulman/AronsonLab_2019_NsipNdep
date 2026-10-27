@@ -1,0 +1,662 @@
+---
+title: "Analysis of soil chemistry for N-sip project"
+author: "Hannah Shulman"
+date: "2024-09-26"
+output: html_document
+---
+
+#  Setup and wrangle data 
+```{r setup, include=FALSE}
+setwd("~/Documents/Projects/nspiral_nsip")
+
+library(vegan)
+library(ggplot2)
+library(stringr)
+library(plyr)
+library(dplyr)
+library(forcats)
+library(ape)
+library(purrr)
+library(cowplot)
+library(gridExtra)
+library(grid)
+library(ggpubr)
+
+# # Import soil extraction data with mass of soil represented by the DNA in each tube:
+# soil.chem <- read.table("nspiral_nsip_soilchem.tsv", header=TRUE, sep="\t")
+# soil.chem$Site <- factor(soil.chem$Site, levels=c("PB", "WC", "MC"))
+# soil.chem$MB_CN_ratio <- soil.chem$MBC / soil.chem$MBN
+# soil.chem$nmT_CN_ratio <- soil.chem$nmTC / soil.chem$nmTN
+# soil.chem$Notes <- NULL
+# 
+# #  std error for bar plots:
+# std <- function(x) sd(x)/sqrt(length(x))
+```
+
+```{r wrangle, include=FALSE}
+# #  add pH to all rows
+# soil.chem$pH_dry <- NA
+# soil.pH <- read.table("nspiral_nsip_pH.tsv", header=TRUE, sep="\t")
+# soil.pH.m<-aggregate(pH ~ Shrub, data = soil.pH, FUN = mean) # average per shrub
+# # Loop through each row of soil.chem
+# for (i in seq_len(nrow(soil.chem))) {
+#   shrub_i <- soil.chem$Shrub[i]
+#   match_i <- soil.pH.m$pH[soil.pH.m$Shrub == shrub_i]
+#   
+#   if (length(match_i) == 1) {
+#     soil.chem$pH_dry[i] <- match_i
+#   }
+# }
+# #  clean up
+# rm(match_i, shrub_i, i, soil.pH, soil.pH.m)
+# 
+# #  split data into 4 treatments
+# sc.Pre <-soil.chem[soil.chem$Treatment == "Pre",]
+# sc.H2O <-soil.chem[soil.chem$Treatment == "H2O ",]
+# sc.NH4 <-soil.chem[soil.chem$Treatment == "NH4",]
+# sc.NO3 <-soil.chem[soil.chem$Treatment == "NO3",]
+# 
+# #  make datasets for change over time
+# sc.H2O.d <- sc.H2O
+# sc.NH4.d <- sc.NH4
+# sc.NO3.d <- sc.NO3
+# sc.H2O.d[,6:15] <- sc.H2O[,6:15] - sc.Pre[,6:15]
+# sc.NH4.d[,6:15] <- sc.NH4[,6:15] - sc.Pre[,6:15]
+# sc.NO3.d[,6:15] <- sc.NO3[,6:15] - sc.Pre[,6:15]
+# 
+# #  join and melt
+# library(reshape)
+# sc.d <- rbind(sc.Pre,sc.H2O.d,sc.NH4.d,sc.NO3.d) #  Pre data + deltas for three treatments
+# sc.d.m <- melt(sc.d, id.vars=colnames(sc.d)[1:5]) # melted sc.d for plotting
+# sc.m <- melt(soil.chem, id.vars=colnames(soil.chem)[1:5]) #  melted soil.chem for plotting
+# rm(sc.H2O,sc.NH4,sc.NO3,sc.H2O.d,sc.NH4.d,sc.NO3.d)
+
+load("~/Documents/Projects/nspiral_nsip/RData/2_soil_chem.RData")
+```
+
+##  Pretreatment models - Table S1
+```{r anovas.1}
+sc.Pre$Site <- factor(sc.Pre$Site, levels=c("PB", "WC", "MC"))
+
+#  loop everything into a table: 
+
+# List of variables to analyze
+vars <- c("pH_dry", "NO3", "NH4", "MBN", "MBC", "nmTC", "nmTN", "nmT_CN_ratio", "MB_CN_ratio")
+names_out <- c("pH", "NO3", "NH4", "MBN", "MBC", "TC", "TN", "(t)C:N", "(mb)C:N")
+
+# Prepare an empty results list
+results <- vector("list", length(vars))
+names(results) <- names_out
+
+# Loop over variables
+for (i in seq_along(vars)) {
+  var <- vars[i]
+  
+  # Fit model
+  model <- lm(as.formula(paste(var, "~ Site")), data = sc.Pre)
+  an <- anova(model)
+  tuk <- TukeyHSD(aov(model))$Site
+  
+  # Extract ANOVA
+  f_val <- an[1, "F value"]
+  p_val <- an[1, "Pr(>F)"]
+  resid_df <- an[2, "Df"]
+  
+  # Ensure the order: WC-PB, MC-PB, MC-WC
+  comp_names <- c("WC-PB", "MC-PB", "MC-WC")
+  diffs <- tuk[comp_names, "diff"]
+  ps <- tuk[comp_names, "p adj"]
+  
+  # Combine into one row
+  results[[i]] <- c(
+    `Site F` = f_val,
+    `Site p` = p_val,
+    `Residual df` = resid_df,
+    `WC-PB diff` = diffs[1], `WC-PB p` = ps[1],
+    `MC-PB diff` = diffs[2], `MC-PB p` = ps[2],
+    `MC-WC diff` = diffs[3], `MC-WC p` = ps[3]
+  )
+}
+
+# Convert to data frame
+results_df <- as.data.frame(do.call(rbind, results))
+results_df <- cbind(Variable = names_out, results_df)
+colnames(results_df) <- c("Variable","Site.F","Site.p","Res.df", 
+                          "WC-PB.diff", "WC-PB.p", 
+                          "MC-PB.diff", "MC-PB.p",
+                          "MC-WC.diff", "MC-WC.p")
+```
+
+## Incubation Models - Table S2
+```{r anovas.2}
+
+# Define response variables
+responses <- c("NH4", "NO3", "MBN", "MBC", "MB_CN_ratio","nmTC", "nmTN","nmT_CN_ratio")
+
+# Define treatments to compare against Pre
+treatments <- c("H2O ", "NH4", "NO3")
+
+# Initialize output table
+result_table <- matrix(NA, nrow = length(responses), ncol = 4 * length(treatments))
+rownames(result_table) <- responses
+colnames(result_table) <- unlist(lapply(treatments, function(trt) {
+  c(paste0(trt, "_Treatment_F"), paste0(trt, "_Treatment_p"),
+    paste0(trt, "_SiteTrt_F"), paste0(trt, "_SiteTrt_p"))
+}))
+
+# Loop through each response and treatment
+for (i in seq_along(responses)) {
+  response <- responses[i]
+  
+  for (j in seq_along(treatments)) {
+    trt <- treatments[j]
+    
+    # Subset to just Pre and this treatment
+    subdat <- soil.chem[soil.chem$Treatment %in% c("Pre", trt), ]
+    
+    # Remove rows with missing response
+    subdat <- subdat[!is.na(subdat[[response]]), ]
+    
+    # Build formula
+    formula <- as.formula(paste(response, "~ Site * Treatment"))
+    
+    # Fit model
+    fit <- lm(formula, data = subdat)
+    aov_table <- anova(fit)
+    
+    treat_row <- which(rownames(aov_table) == "Treatment")
+    inter_row <- which(rownames(aov_table) == "Site:Treatment")
+    
+    result_table[i, 4*(j-1) + 1] <- aov_table$"F value"[treat_row]
+    result_table[i, 4*(j-1) + 2] <- aov_table$"Pr(>F)"[treat_row]
+    result_table[i, 4*(j-1) + 3] <- aov_table$"F value"[inter_row]
+    result_table[i, 4*(j-1) + 4] <- aov_table$"Pr(>F)"[inter_row]
+  }
+}
+
+# Final result
+result_df <- as.data.frame(result_table)
+
+```
+
+## Incubation models - Table s3
+```{r anovas.3}
+# Keep only delta values for the three treatments — drop the raw dry (Pre) data entirely
+sc.d.trt <- sc.d.m[sc.d.m$Treatment != "Pre", ]
+sc.d.trt$Treatment <- factor(sc.d.trt$Treatment, levels = c("H2O ", "NH4", "NO3"))
+sc.d.trt$Site <- factor(sc.d.trt$Site, levels = c("PB", "WC", "MC"))
+
+# List of variables to analyze (same set as before — pH_dry excluded, no delta exists for it)
+vars <- c("NH4", "NO3", "MBN", "MBC", "nmTC", "nmTN", "nmT_CN_ratio", "MB_CN_ratio")
+names_out <- c("NH4", "NO3", "MBN", "MBC", "TC", "TN", "(t)C:N", "(mb)C:N")
+
+# Prepare an empty results list
+results3 <- vector("list", length(vars))
+names(results3) <- names_out
+
+# Loop over variables
+for (i in seq_along(vars)) {
+  var <- vars[i]
+  
+  # Subset to this variable's delta values
+  subdat <- sc.d.trt[sc.d.trt$variable == var, ]
+  
+  # Fit model with Site as a fixed, interacting effect
+  model <- lm(value ~ Site * Treatment, data = subdat)
+  an <- anova(model)
+  tuk <- TukeyHSD(aov(model))$Treatment
+  
+  # Extract ANOVA rows
+  treat_row <- which(rownames(an) == "Treatment")
+  inter_row <- which(rownames(an) == "Site:Treatment")
+  resid_row <- which(rownames(an) == "Residuals")
+  
+  f_val <- an[treat_row, "F value"]
+  treat_df <- an[treat_row, "Df"]
+  p_val <- an[treat_row, "Pr(>F)"]
+  inter_f <- an[inter_row, "F value"]
+  inter_df <- an[inter_row, "Df"]
+  inter_p <- an[inter_row, "Pr(>F)"]
+  resid_df <- an[resid_row, "Df"]
+  
+  # Order: NH4-H2O, NO3-H2O, NO3-NH4 (H2O as reference level)
+  comp_names <- c("NH4-H2O ", "NO3-H2O ", "NO3-NH4")
+  diffs <- tuk[comp_names, "diff"]
+  ps <- tuk[comp_names, "p adj"]
+  
+  # Combine into one row
+  results3[[i]] <- c(
+    `Treatment F` = f_val,
+    `Treatment df` = treat_df,
+    `Treatment p` = p_val,
+    `SiteTrt F` = inter_f,
+    `SiteTrt df` = inter_df,
+    `SiteTrt p` = inter_p,
+    `Residual df` = resid_df,
+    `NH4-H2O diff` = diffs[1], `NH4-H2O p` = ps[1],
+    `NO3-H2O diff` = diffs[2], `NO3-H2O p` = ps[2],
+    `NO3-NH4 diff` = diffs[3], `NO3-NH4 p` = ps[3]
+  )
+}
+
+# Convert to data frame
+results3_df <- as.data.frame(do.call(rbind, results3))
+results3_df <- cbind(Variable = names_out, results3_df)
+colnames(results3_df) <- c("Variable","Treatment.F","Treatment.df","Treatment.p",
+                          "SiteTrt.F","SiteTrt.df","SiteTrt.p","Res.df", 
+                          "NH4-H2O.diff", "NH4-H2O.p", 
+                          "NO3-H2O.diff", "NO3-H2O.p",
+                          "NO3-NH4.diff", "NO3-NH4.p")
+```
+
+## Fig 2: dry and h2O/NH4 rewet - extractable N, microbial biomass C/N
+```{r Fig2}
+colors <- c("#7698FF", "#18d2ad", "#affb42")
+
+# plot function
+plot_mean_se_points <- function(data) {
+  library(ggplot2)
+  library(ggpubr)
+
+  y_max <- max(data$value, na.rm = TRUE)
+  y_pad <- 0.15 * y_max
+
+  ggplot(data, aes(x = Site, y = value)) +
+    geom_jitter(aes(color = Site),
+                width = 0.08,
+                size = 3,
+                alpha = 0.8) +
+    stat_summary(fun.data = mean_se,
+                 geom = "errorbar",
+                 width = 0.15,
+                 color = "black",
+                 size = 0.8) +
+    stat_summary(fun = mean,
+                 geom = "point",
+                 shape = 95,
+                 size = 10,
+                 color = "black") +
+    expand_limits(y = y_max + y_pad) +
+    scale_color_manual(values = colors) +
+    scale_x_discrete(labels = c("PB" = "Low",
+                                "WC" = "Mid",
+                                "MC" = "High")) +
+    theme_bw() +
+    theme(
+      text = element_text(size = 13),
+      legend.position = "none",
+      panel.grid = element_blank(),
+      axis.title = element_blank()
+    )
+}
+
+## A — NH4+ (Dry)
+dat_a <- subset(sc.d.m, Treatment == "Pre" & variable == "NH4")
+a <- plot_mean_se_points(dat_a) +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey") +
+  ylim(0, 21) +
+  labs(tag = "A")
+
+## B — NO3- (Dry)
+dat_c <- subset(sc.d.m, Treatment == "Pre" & variable == "NO3")
+b <- plot_mean_se_points(dat_c) +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC"), c("PB", "WC"), c("WC", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey") +
+  ylim(0, 25) +
+  labs(tag = "B")
+
+## C — MBN (Dry)
+dat_e <- subset(sc.d.m, Treatment == "Pre" & variable == "MBN")
+c <- plot_mean_se_points(dat_e) +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC"), c("WC", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey") +
+  ylim(0, 230) +
+  labs(tag = "C")
+
+## D — MBC (Dry)
+dat_g <- subset(sc.d.m, Treatment == "Pre" & variable == "MBC")
+d <- plot_mean_se_points(dat_g) +
+  labs(tag = "D")
+
+## E — NH4+ (Rewet H2O; change)
+dat_b <- subset(sc.d.m, Treatment == "H2O " & variable == "NH4")
+e <- plot_mean_se_points(dat_b) +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey") +
+  ylim(-18, 25) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "E")
+
+## F — NO3- (Rewet H2O; change)
+dat_d <- subset(sc.d.m, Treatment == "H2O " & variable == "NO3")
+f <- plot_mean_se_points(dat_d) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "F")
+
+## G — MBN (Rewet H2O; change)
+dat_f <- subset(sc.d.m, Treatment == "H2O " & variable == "MBN")
+g <- plot_mean_se_points(dat_f) +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC"), c("WC", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey") +
+  ylim(-80, 80) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "G")
+
+## H — MBC (Rewet H2O; change)
+dat_h <- subset(sc.d.m, Treatment == "H2O " & variable == "MBC")
+h <- plot_mean_se_points(dat_h) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "H")
+
+## I — NH4+ (Rewet NH4; change)
+dat_b <- subset(sc.d.m, Treatment == "NH4" & variable == "NH4")
+i <- plot_mean_se_points(dat_b) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "I")
+
+## J — NO3- (Rewet NH4; change)
+dat_c <- subset(sc.d.m, Treatment == "NH4" & variable == "NO3")
+j <- plot_mean_se_points(dat_c) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "J")
+
+## K — MBN (Rewet NH4; change)
+dat_f <- subset(sc.d.m, Treatment == "NH4" & variable == "MBN")
+k <- plot_mean_se_points(dat_f) +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC"), c("WC", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey") +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "K") + ylim(-75,175)
+
+## L — MBC (Rewet NH4; change)
+dat_h <- subset(sc.d.m, Treatment == "NH4" & variable == "MBC")
+l <- plot_mean_se_points(dat_h) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "L")
+
+# column titles — units on new line
+col_titles <- arrangeGrob(
+  nullGrob(),
+  textGrob(expression(atop(bold("Extractable " * NH[4]^"+"),
+                           bold("(µg g"^{-1} * " soil)")))),
+  textGrob(expression(atop(bold("Extractable " * NO[3]^"-"),
+                           bold("(µg g"^{-1} * " soil)")))),
+  textGrob(expression(atop(bold("Microbial Biomass N"),
+                           bold("(µg g"^{-1} * " soil)")))),
+  textGrob(expression(atop(bold("Microbial Biomass C"),
+                           bold("(µg g"^{-1} * " soil)")))),
+  nrow = 1, widths = c(0.75, 2, 2, 2, 2))
+
+# row titles
+row_titles <- arrangeGrob(
+  textGrob(expression(atop(bold("Concentration in dry"),
+                           bold("(pre-treatment) soils"))),
+           rot = 90),
+  textGrob(expression(atop(bold(Delta ~ "concentration,"),
+                           bold(H[2]*O ~ "incubation"))),
+           rot = 90),
+  textGrob(expression(atop(bold(Delta ~ "concentration,"),
+                           bold(NH[4]^"+" ~ "incubation"))),
+           rot = 90),
+  ncol = 1)
+
+plots <- arrangeGrob(a, b, c, d, e, f, g, h, i, j, k, l, nrow = 3)
+
+grid.arrange(
+  col_titles,
+  arrangeGrob(
+    row_titles,
+    plots,
+    ncol = 2,
+    widths = c(0.75, 10)
+  ),
+  textGrob("N-deposition and Precipitation", gp = gpar(fontface = "bold")),
+  ncol = 1,
+  heights = c(1, 10, 0.5)
+)
+```
+
+#  Supplemental Figures
+## Fig S1: dry pH
+```{r sFig 1}
+dat_a <- subset(sc.d.m, Treatment == "Pre" & variable == "pH_dry")
+a <- plot_mean_se_points(dat_a) +
+  xlab("Nitrogen Deposition") +
+  ylab("pH") +
+  ggtitle(expression("Dry pH")) +
+  stat_compare_means(
+    comparisons = list(c("PB", "WC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey"
+  ) +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) + ylim(6,8)
+
+```
+
+#. sFig 2: NO3 rewet - extractable N, microbial biomass C/N
+```{r sFig 2}
+
+dat_a <- subset(sc.d.m, Treatment == "NH4" & variable == "NH4")
+a <- plot_mean_se_points(dat_a) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression(NH[4]^"+" ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle(expression("NH4 incubated, Extractable " * NH[4]^"+")) +
+  labs(tag = "A") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+dat_b <- subset(sc.d.m, Treatment == "NO3" & variable == "NH4")
+b <- plot_mean_se_points(dat_b) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression("change in " * NH[4]^"+" ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle(expression("NO3 incubated, Extractable " * NH[4]^"+")) +
+  labs(tag = "E") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) + 
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+dat_c <- subset(sc.d.m, Treatment == "NH4" & variable == "NO3")
+c <- plot_mean_se_points(dat_c) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression(NO[3]^"-" ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle(expression("NH4 incubated, Extractable " * NO[3]^"-")) +
+  labs(tag = "B") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) + 
+    geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+
+dat_d <- subset(sc.d.m, Treatment == "NO3" & variable == "NO3")
+d <- plot_mean_se_points(dat_d) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression("change in " * NO[3]^"-" ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle(expression("NO3 incubated, Extractable " * NO[3]^"-")) +
+  labs(tag = "F") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+dat_e <- subset(sc.d.m, Treatment == "NH4" & variable == "MBN")
+e <- plot_mean_se_points(dat_e) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression("change in " * MBN ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle("NH4 incubated MBN") +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC"), c("WC", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey"
+  ) +
+  labs(tag = "C") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+
+dat_f <- subset(sc.d.m, Treatment == "NO3" & variable == "MBN")
+f <- plot_mean_se_points(dat_f) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression("change in " * MBN ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle("NO3 incubated MBN") +
+  stat_compare_means(
+    comparisons = list(c("PB", "MC"), c("WC", "MC")),
+    method = "t.test", size = 6, label = "p.signif",
+    hide.ns = TRUE, p.adjust.method = "tukey"
+  ) +
+  labs(tag = "G") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) + 
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+dat_g <- subset(sc.d.m, Treatment == "NH4" & variable == "MBC")
+g <- plot_mean_se_points(dat_g) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression("change in " * MBC ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle("NH4 incubated, MBC") +
+  labs(tag = "D") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) +
+    geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+
+## H — MBC (Rewet; change)
+dat_h <- subset(sc.d.m, Treatment == "NO3" & variable == "MBC")
+h <- plot_mean_se_points(dat_h) +
+  xlab("Nitrogen Deposition") +
+  ylab(expression("change in " * MBC ~ "(µg g"^{-1} * " soil)")) +
+  ggtitle("NO3 incubated, MBC") +
+  labs(tag = "H") +
+  theme(plot.tag = element_text(face = "bold", size = 16),
+        plot.tag.position = c(0.01, 0.98)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6)
+
+
+# plot all
+grid.arrange(a,c,e,g,b,d,f,h, nrow=2)
+
+```
+
+#. sFig 3: TC from all incubations
+```{r sFig_TC}
+#comparisons = list(c("PB", "MC"), c("MC", "WC"), c("WC", "PB")),
+
+## Row 1 — Pre (dry concentrations)
+dat_a <- subset(sc.d.m, Treatment == "Pre" & variable == "nmTC")
+a <- plot_mean_se_points(dat_a) + labs(tag = "A")
+
+dat_b <- subset(sc.d.m, Treatment == "Pre" & variable == "nmTN")
+b <- plot_mean_se_points(dat_b) + labs(tag = "B")
+
+dat_c <- subset(sc.d.m, Treatment == "Pre" & variable == "nmT_CN_ratio")
+c <- plot_mean_se_points(dat_c) + labs(tag = "C")
+
+## Row 2 — H2O incubation (change)
+dat_d <- subset(sc.d.m, Treatment == "H2O " & variable == "nmTC")
+d <- plot_mean_se_points(dat_d) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "D")
+
+dat_e <- subset(sc.d.m, Treatment == "H2O " & variable == "nmTN")
+e <- plot_mean_se_points(dat_e) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "E")
+
+dat_f <- subset(sc.d.m, Treatment == "H2O " & variable == "nmT_CN_ratio")
+f <- plot_mean_se_points(dat_f) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "F")
+
+## Row 3 — NH4 incubation (change)
+dat_g <- subset(sc.d.m, Treatment == "NH4" & variable == "nmTC")
+g <- plot_mean_se_points(dat_g) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "G")
+
+dat_h <- subset(sc.d.m, Treatment == "NH4" & variable == "nmTN")
+h <- plot_mean_se_points(dat_h) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "H")
+
+dat_i <- subset(sc.d.m, Treatment == "NH4" & variable == "nmT_CN_ratio")
+i <- plot_mean_se_points(dat_i) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "I")
+
+## Row 4 — NO3 incubation (change)
+dat_j <- subset(sc.d.m, Treatment == "NO3" & variable == "nmTC")
+j <- plot_mean_se_points(dat_j) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "J")
+
+dat_k <- subset(sc.d.m, Treatment == "NO3" & variable == "nmTN")
+k <- plot_mean_se_points(dat_k) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "K")
+
+dat_l <- subset(sc.d.m, Treatment == "NO3" & variable == "nmT_CN_ratio")
+l <- plot_mean_se_points(dat_l) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.6) +
+  labs(tag = "L")
+
+# column titles
+col_titles <- arrangeGrob(
+  nullGrob(),
+  textGrob(expression(atop(bold("Extractable Organic Carbon"),
+                           bold("(µg g"^{-1} * " soil)")))),
+  textGrob(expression(atop(bold("Extractable Total Nitrogen"),
+                           bold("(µg g"^{-1} * " soil)")))),
+  textGrob(expression(atop(bold("C:N Ratio"), bold("")))),
+  nrow = 1, widths = c(0.75, 2, 2, 2))
+
+# row titles
+row_titles <- arrangeGrob(
+  textGrob(expression(atop(bold("Concentration in dry"),
+                           bold("(pre-treatment) soils"))),
+           rot = 90),
+  textGrob(expression(atop(bold(Delta ~ "concentration,"),
+                           bold(H[2]*O ~ "incubation"))),
+           rot = 90),
+  textGrob(expression(atop(bold(Delta ~ "concentration,"),
+                           bold(NH[4]^"+" ~ "incubation"))),
+           rot = 90),
+  textGrob(expression(atop(bold(Delta ~ "concentration,"),
+                           bold(NO[3]^"-" ~ "incubation"))),
+           rot = 90),
+  ncol = 1)
+
+plots <- arrangeGrob(a, b, c, d, e, f, g, h, i, j, k, l, nrow = 4)
+
+grid.arrange(
+  col_titles,
+  arrangeGrob(
+    row_titles,
+    plots,
+    ncol = 2,
+    widths = c(0.75, 10)
+  ),
+  textGrob("N-deposition and Precipitation", gp = gpar(fontface = "bold")),
+  ncol = 1,
+  heights = c(1, 10, 0.5)
+)
+
+
+
+
+
+
+```
+

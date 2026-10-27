@@ -1,0 +1,1008 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-11-25"
+---
+
+#. 0. import data
+```{r setup, include=FALSE}
+setwd("~/Documents/Projects/nspiral_nsip")
+
+library(vegan)
+library(ggplot2)
+library(stringr)
+library(plyr)
+library(dplyr)
+library(forcats)
+library(ape)
+library(purrr)
+library(cowplot)
+library(gridExtra)
+library(reshape2)
+library(ggpubr)
+library(parameters)
+library(picante)
+
+# std <- function(x) sd(x)/sqrt(length(x))
+# #load("~/Documents/Projects/nspiral_nsip/RData/homebrew_output_dec2025.RData")
+# load("~/Documents/Projects/nspiral_nsip/RData/homebrew_output_may2026_t1.RData")
+# #load("~/Documents/Projects/nspiral_nsip/RData/homebrew_output_may2026_t2.RData")
+# 
+# #. ft               = un-normalized feature table made from LULU-merged ASVs
+# #. ft.t             = un-normalized feature table that has been trimmed of low-abundance reads and contaminants, made from LULU-merged ASVs
+# #. ft.t.inc         = incorporators with EAF value
+# #. ft.t.pa          = presence absence of all taxa 
+# #. ft.clustered     = ft, but phylogenetically clustered at h=0.03
+# #. ft.clustered.inc = incorporators with EAF value
+# #. ft.clustered.pa  = presence absence of all taxa 
+# #. ft.Mlab          = observed labeled molecular weight of the DNA sequence of each taxa
+# #. md               = sample metadata which includes qPCR
+# #. Sdat             = additional data about soil sampling, for N assimilated calculations
+# #. tree             = phylogenetic tree matching ft 
+# #. tt               = taxatable matching ft, SILVA 138
+# #. tt.t             = taxatable matching ft.t, SILVA 138
+# #. tt.clustered     = taxxtable matching ft.clustered, SILVA 138
+# 
+# #. soil chemistry data
+# load("~/Documents/Projects/nspiral_nsip/RData/2_soil_chem.RData")
+# #  wrangle data
+# inc.env.NH4 <- sc.d[sc.d$Treatment=="NH4" & sc.d$Shrub%in%colnames(ft.t.inc),]
+# inc.env.NH4 <- inc.env.NH4[match(colnames(ft.t.inc)[1:10], inc.env.NH4$Shrub),]
+# inc.env.pre <- sc.d[sc.d$Treatment=="Pre" & sc.d$Shrub%in%colnames(ft.t.inc),]
+# inc.env.pre <- inc.env.pre[match(colnames(ft.t.inc)[1:10], inc.env.pre$Shrub), ]
+# inc.env.H2O <- sc.d[sc.d$Treatment=="H2O " & sc.d$Shrub%in%colnames(ft.t.inc),]
+# inc.env.H2O <- inc.env.H2O[match(colnames(ft.t.inc)[1:10], inc.env.H2O$Shrub), ]
+
+load("~/Documents/Projects/nspiral_nsip/3_inc_analysis.RData")
+```
+
+#  1A. calculate the diversity of incorporators/non incorporators
+```{r calc_div}
+library(picante)
+
+shrubs <- colnames(ft.t.inc)   # samples with EAF data
+taxa   <- rownames(ft.t.pa)
+
+#. EAF aligned to ft.t.pa rows; NA or missing = 0
+eaf <- matrix(0, nrow = length(taxa), ncol = length(shrubs),
+              dimnames = list(taxa, shrubs))
+shared <- intersect(taxa, rownames(ft.t.inc))
+eaf[shared, ] <- as.matrix(ft.t.inc[shared, shrubs])
+eaf[is.na(eaf)] <- 0
+setdiff(rownames(ft.t.inc), taxa)   # should be empty
+
+#. presence in each sample's NH4 incubation (heavy t4 or light t5)
+pres <- sapply(shrubs, function(s) {
+  cols <- paste0(s, c("t4", "t5"))
+  as.integer(rowSums(ft.t.pa[, cols, drop = FALSE] > 0) > 0)
+})
+rownames(pres) <- taxa
+
+#. per-sample classification
+inc.m <- (eaf > 0) * 1L                 # incorporators in that sample
+all.m <- ((pres + inc.m) > 0) * 1L      # all taxa in that sample
+ni.m  <- all.m * (1L - inc.m)           # present but not incorporating there
+
+#. richness
+rich <- data.frame(total_richness = colSums(all.m),
+                   i_richness     = colSums(inc.m),
+                   ni_richness    = colSums(ni.m))
+
+#. Faith's PD: one pd() call on all three community sets
+comm <- rbind(t(all.m), t(inc.m), t(ni.m))
+rownames(comm) <- c(paste0(shrubs, "_all"), paste0(shrubs, "_inc"), paste0(shrubs, "_ni"))
+comm <- comm[, colnames(comm) %in% tree$tip.label, drop = FALSE]
+tree.p <- drop.tip(tree, setdiff(tree$tip.label, colnames(comm)))
+pds <- pd(comm, tree.p, include.root = TRUE)
+
+#. combine
+div <- data.frame(
+  sample         = shrubs,
+  site           = substr(shrubs, 1, 2),
+  rich[shrubs, ],
+  total_fpd      = pds[paste0(shrubs, "_all"), "PD"],
+  i_fpd          = pds[paste0(shrubs, "_inc"), "PD"],
+  ni_fpd         = pds[paste0(shrubs, "_ni"),  "PD"],
+  row.names = NULL
+)
+
+div
+```
+#  1B. run model and make table s5
+```{r table_s5}
+dat.A <- div
+dat.A$Site <- factor(c(PB = "Low", WC = "Mid", MC = "High")[dat.A$site],
+                     levels = c("Low", "Mid", "High"))
+
+responses <- c("N-assimilator richness"   = "i_richness",
+               "N-assimilator FPD"        = "i_fpd",
+               "Non-assimilator richness" = "ni_richness",
+               "Non-assimilator FPD"      = "ni_fpd")
+
+#. contrasts in table order (first - second)
+comps <- list(c("Mid", "High"), c("Low", "High"), c("Low", "Mid"))
+
+tab5 <- do.call(rbind, lapply(names(responses), function(nm) {
+
+  m  <- aov(as.formula(paste(responses[nm], "~ Site")), data = dat.A)
+  a  <- anova(m)
+  tk <- TukeyHSD(m, "Site")$Site
+
+  #. Tukey md and p, flipping sign if R lists the pair the other way
+  tk.out <- unlist(lapply(comps, function(x) {
+    ab <- paste0(x[1], "-", x[2]); ba <- paste0(x[2], "-", x[1])
+    if (ab %in% rownames(tk)) c(md =  tk[ab, "diff"], p = tk[ab, "p adj"])
+    else                      c(md = -tk[ba, "diff"], p = tk[ba, "p adj"])
+  }))
+  names(tk.out) <- paste(rep(sapply(comps, paste, collapse = "-"), each = 2),
+                         c("md", "p"), sep = "_")
+
+  data.frame(Response = nm,
+             F    = round(a["Site", "F value"], 2),
+             p    = round(a["Site", "Pr(>F)"], 3),
+             n.df = a["Site", "Df"],
+             d.df = a["Residuals", "Df"],
+             t(round(tk.out, 3)),
+             check.names = FALSE)
+}))
+
+```
+
+# 2A. calculate richness of total bacterial community and add 16S data
+```{r calc_total_div}
+#  add rows for light incubation to metadata for diversity modeling
+t4 <- sc.d[sc.d$Treatment == "NH4", ]
+t4$MCSID      <- sub("t5$", "t4", t4$MCSID)
+t4$Incubation <- "t4"
+t4[, !(colnames(t4) %in% c("MCSID", "Incubation", "Treatment", "Shrub", "Site"))] <- NA
+rownames(t4) <- NULL
+sc.d <- rbind(sc.d, t4)
+
+#. aggregate 16S qPCR data add to MD
+qpcr <- tapply(md$copies.ul, md$incubation, sum, na.rm = TRUE)
+sc.d$qpcr <- qpcr[match(sc.d$MCSID, names(qpcr))]
+rm(t4,qpcr)
+
+#. create additional presence-absence datasets so we have all observed taxa (ft.t.pa) and and non-incorporators (ft.t.pa.2)
+ft.t.pa.2 <- ft.t.pa[!(row.names(ft.t.pa)%in%row.names(ft.t.inc)),]
+
+#. take the presence/absence data from the column sums and add to MD
+rich<-colSums(ft.t.pa)
+sc.d$total_richness <- rich[match(sc.d$MCSID, names(rich))]
+rich<-colSums(ft.t.pa.2)
+sc.d$ni_richness <- rich[match(sc.d$MCSID, names(rich))]
+
+#. calculate faith's PD
+## Faith's PD (ASV-level, using tree)
+asv_comm <- t((ft.t.pa > 0) * 1L)   # samples x taxa
+common_asv <- intersect(colnames(asv_comm), tree$tip.label)
+asv_comm_pd <- asv_comm[, common_asv, drop = FALSE]
+tree_asv_pd <- drop.tip(tree, setdiff(tree$tip.label, common_asv))
+PD_ASV_vec <- pd(asv_comm_pd, tree_asv_pd, include.root = TRUE)$PD
+names(PD_ASV_vec) <- rownames(asv_comm_pd)  # sample names
+sc.d$total_fpd <- PD_ASV_vec[match(sc.d$MCSID, names(PD_ASV_vec))]
+
+asv_comm <- t((ft.t.pa.2 > 0) * 1L)   # samples x taxa
+common_asv <- intersect(colnames(asv_comm), tree$tip.label)
+asv_comm_pd <- asv_comm[, common_asv, drop = FALSE]
+tree_asv_pd <- drop.tip(tree, setdiff(tree$tip.label, common_asv))
+PD_ASV_vec <- pd(asv_comm_pd, tree_asv_pd, include.root = TRUE)$PD
+names(PD_ASV_vec) <- rownames(asv_comm_pd)  # sample names
+sc.d$ni_fpd <- PD_ASV_vec[match(sc.d$MCSID, names(PD_ASV_vec))]
+
+rm(asv_comm,common_asv,tree_asv_pd,PD_ASV_vec,qpcr,rich,rng)
+
+#. for the NH4 incubations, subtract pre treatment to make it a delta like the other values
+sc.d.2<- sc.d #. no differences calculated 
+
+sc.d[25:36,]$qpcr <- (sc.d[25:36,]$qpcr - sc.d[1:12,]$qpcr)
+sc.d[25:36,]$total_richness <- (sc.d[25:36,]$total_richness - sc.d[1:12,]$total_richness)
+sc.d[25:36,]$total_fpd <- (sc.d[25:36,]$total_fpd - sc.d[1:12,]$total_fpd)
+sc.d[25:36,]$ni_richness <- (sc.d[25:36,]$ni_richness - sc.d[1:12,]$ni_richness)
+sc.d[25:36,]$ni_fpd <- (sc.d[25:36,]$ni_fpd - sc.d[1:12,]$ni_fpd)
+sc.d[25:36,]$i_richness <- (sc.d[25:36,]$i_richness - sc.d[1:12,]$i_richness)
+```
+
+# 2B. run model and make table s6
+```{r table_s6}
+#. raw values (sc.d.2), not deltas, since Dry is a level in the model
+dat.B <- sc.d.2
+dat.B$Treatment <- factor(c(tp = "Dry", t5 = "14NH4", t4 = "15NH4")[dat.B$Incubation],
+                          levels = c("Dry", "14NH4", "15NH4"))
+dat.B$Site <- factor(c(PB = "Low", WC = "Mid", MC = "High")[dat.B$Site],
+                     levels = c("Low", "Mid", "High"))
+dat.B <- droplevels(subset(dat.B, !is.na(Treatment)))
+
+responses <- c("16S gene copies" = "qpcr",
+               "Total richness"  = "total_richness",
+               "Total FPD"       = "total_fpd")
+
+#. contrasts in table order (first - second)
+comps <- list(c("15NH4", "Dry"))
+
+tab6 <- do.call(rbind, lapply(names(responses), function(nm) {
+
+  m  <- aov(as.formula(paste(responses[nm], "~ Treatment * Site")), data = dat.B)
+  a  <- anova(m)
+  tk <- TukeyHSD(m, "Treatment")$Treatment
+
+  #. Tukey md and p, flipping sign if R lists the pair the other way
+  tk.out <- unlist(lapply(comps, function(x) {
+    ab <- paste0(x[1], "-", x[2]); ba <- paste0(x[2], "-", x[1])
+    if (ab %in% rownames(tk)) c(md =  tk[ab, "diff"], p = tk[ab, "p adj"])
+    else                      c(md = -tk[ba, "diff"], p = tk[ba, "p adj"])
+  }))
+  names(tk.out) <- paste(rep(sapply(comps, paste, collapse = "-"), each = 2),
+                         c("md", "p"), sep = "_")
+
+  data.frame(Response    = nm,
+             Trt_F       = round(a["Treatment", "F value"], 2),
+             Trt_p       = round(a["Treatment", "Pr(>F)"], 3),
+             Trt_n.df    = a["Treatment", "Df"],
+             TrtSite_F   = round(a["Treatment:Site", "F value"], 2),
+             TrtSite_p   = round(a["Treatment:Site", "Pr(>F)"], 3),
+             TrtSite_n.df = a["Treatment:Site", "Df"],
+             d.df        = a["Residuals", "Df"],
+             t(round(tk.out, 3)),
+             check.names = FALSE)
+}))
+
+```
+
+# 3. here report EAF summary stats
+```{r means}
+
+#. mean and SD of EAF
+x <- unlist(ft.t.inc)
+c(mean = mean(x[x != 0], na.rm = TRUE),
+  sd   = sd(x[x != 0],   na.rm = TRUE))
+
+# number of incorporators
+mean(colSums(!is.na(ft.t.inc) & ft.t.inc != 0))
+sd(colSums(!is.na(ft.t.inc) & ft.t.inc != 0))
+
+# number of taxa present in soil
+grp <- substr(colnames(ft.t.pa), 1, 5)
+idx <- split(seq_along(grp), grp)
+
+ft.merged <- as.data.frame(
+  sapply(idx, function(i) {
+    as.integer(rowSums(ft.t.pa[, i, drop = FALSE] != 0, na.rm = TRUE) > 0)
+  })
+)
+rownames(ft.merged) <- rownames(ft.t.pa)
+
+# what percent are incorporators
+percents<-(colSums(!is.na(ft.t.inc) & ft.t.inc != 0)) / ((colSums(!is.na(ft.merged) & ft.merged != 0))[2:10])
+
+# what taxa are present at all 3 sites
+present_all_three <- with(ft.t.inc, {
+  mc <- rowSums(.SD <- ft.t.inc[, grepl("^MC", colnames(ft.t.inc))] > 0, na.rm = TRUE) > 0
+  pb <- rowSums(ft.t.inc[, grepl("^PB", colnames(ft.t.inc))] > 0, na.rm = TRUE) > 0
+  wc <- rowSums(ft.t.inc[, grepl("^WC", colnames(ft.t.inc))] > 0, na.rm = TRUE) > 0
+  mc & pb & wc
+})
+
+sum(present_all_three)              # number of taxa
+rownames(ft.t.inc)[present_all_three]  # which taxa
+
+var_eaf <- apply(ft.t.inc[present_all_three, , drop = FALSE], 1, function(x) {
+  var(x[!is.na(x) & x > 0])
+})
+
+var_eaf
+
+#  how many bacteria vs archaea
+dim(tt.t[row.names(tt.t)%in%row.names(ft.t.inc) & tt.t$Kingdom=="Bacteria",])
+dim(tt.t[row.names(tt.t)%in%row.names(ft.t.inc) & tt.t$Kingdom=="Archaea",])
+57/4226 # percent observed archaea
+18/877 # percent assimilator archaea
+```
+
+# 4. model richness against edaphic data
+
+## 4A modeling incorporator richness against dry soil parameters
+```{r model_richness, include=FALSE}
+# add data to inc.env.pre
+inc.env.pre$Rich_ASV_inc <- div$i_richness
+inc.env.pre$PD_ASV_inc <- div$i_fpd
+
+#  one example model 
+model<-lm(Rich_ASV_inc ~ pH_dry, data=inc.env.pre)
+anova(model)
+standardize_parameters(model)
+
+#  create a table of all models
+# Create an empty results table
+model_results1 <- data.frame()
+# Define responses and predictors
+responses <- c("Rich_ASV_inc", "PD_ASV_inc")
+predictors <- c("pH_dry", "NO3", "NH4", "MBN", "MBC", "MB_CN_ratio", "nmTC", "nmTN", "nmT_CN_ratio")
+# Loop over responses and predictors
+for (resp in responses) {
+  row <- list(Response = resp)
+  for (pred in predictors) {
+    # Construct model formula
+    formula <- as.formula(paste(resp, "~", pred))
+    # Fit model, handle small sample errors
+    model <- tryCatch(lm(formula, data = inc.env.pre), error = function(e) NULL)
+    
+    if (!is.null(model)) {
+      aov_res <- anova(model)
+      f_val <- aov_res[1, "F value"]
+      p_val <- aov_res[1, "Pr(>F)"]
+      std_beta <- tryCatch(standardize_parameters(model)$Std_Coefficient[2], error = function(e) NA)
+    } else {
+      f_val <- NA
+      p_val <- NA
+      std_beta <- NA
+    }
+    
+    # Add to row with column names like pH.F, pH.p, pH.beta
+    row[[paste0(pred, ".F")]] <- f_val
+    row[[paste0(pred, ".p")]] <- p_val
+    row[[paste0(pred, ".beta")]] <- std_beta
+  }
+  model_results1 <- rbind(model_results1, as.data.frame(row))
+}
+
+#  clean env
+rm(f_val,formula,p_val,pred,predictors,resp, responses,std_beta, row,model)
+```
+### pH --> richness, MBN --> PD. no other sig relationships. (marginal correlation between MBC and richness)
+
+## 4B model 16S and the other other species dynamics
+```{r model_richness, include=FALSE}
+
+#  create a table of all models
+# Create an empty results table
+model_results2 <- data.frame()
+# Define responses and predictors
+responses <- c("qpcr", "total_richness", "ni_richness", "total_fpd", "ni_fpd")
+predictors <- c("pH_dry", "NO3", "NH4", "MBN", "MBC", "MB_CN_ratio", "nmTC", "nmTN", "nmT_CN_ratio")
+# Loop over responses and predictors
+for (resp in responses) {
+  row <- list(Response = resp)
+  for (pred in predictors) {
+    # Construct model formula
+    formula <- as.formula(paste(resp, "~", pred))
+    # Fit model, handle small sample errors
+    model <- tryCatch(lm(formula, data = sc.d.2), error = function(e) NULL)
+    
+    if (!is.null(model)) {
+      aov_res <- anova(model)
+      f_val <- aov_res[1, "F value"]
+      p_val <- aov_res[1, "Pr(>F)"]
+      std_beta <- tryCatch(standardize_parameters(model)$Std_Coefficient[2], error = function(e) NA)
+    } else {
+      f_val <- NA
+      p_val <- NA
+      std_beta <- NA
+    }
+    
+    # Add to row with column names like pH.F, pH.p, pH.beta
+    row[[paste0(pred, ".F")]] <- f_val
+    row[[paste0(pred, ".p")]] <- p_val
+    row[[paste0(pred, ".beta")]] <- std_beta
+  }
+  model_results2 <- rbind(model_results2, as.data.frame(row))
+}
+
+#  clean env
+rm(f_val,formula,p_val,pred,predictors,resp, responses,std_beta, row,model)
+```
+
+## 5. plot richness graphs
+```{r plot_richness_F3_v2}
+library(ggplot2)
+library(ggpubr)
+
+colors<-c("#7698FF", "#18d2ad", "#affb42")
+
+#. make plot function
+make_plot <- function(data, x, y) {
+  ggplot(data, aes(x = {{x}}, y = {{y}})) + 
+     geom_jitter(aes(color = Site), width = 0.08, size = 3, alpha = 0.8) +
+     stat_summary(fun.data = mean_se, geom = "errorbar",
+               width = 0.15, color = "black", size = 0.8) +
+     stat_summary(fun = mean, geom = "point",
+               shape = 95, size = 10, color = "black") +
+     scale_color_manual(values = colors) +
+     scale_x_discrete(labels = c("PB" = "Low",
+                                "WC" = "Mid",
+                                "MC" = "High")) +
+    theme_bw() + theme(text = element_text(size = 13), legend.position = "none",
+    panel.grid = element_blank()) 
+    }
+
+#. Figure 3B - Inc Richness across Site
+B_inc_sr <- make_plot(inc.env.pre, Site, Rich_ASV_inc) + 
+  labs(tag = "B") + ylab("") + xlab("") + ylim(50,550)
+#. Figure 3E - Inc FPD across Site
+E_inc_fpd <- make_plot(inc.env.pre, Site, PD_ASV_inc) + 
+  labs(tag = "E") + ylab("") + xlab("") + ylim(2,13) +
+  stat_compare_means(comparisons = list(c("PB", "WC"), c("PB", "MC")),
+                     method = "t.test", size= 6, label = "p.signif",hide.ns = TRUE,
+                     p.adjust.method = "tukey") +
+  annotate("text", label="F[2,7]=12.23, p =0.005",  x = Inf, y = Inf,hjust = 1.1, vjust = 1.5, size = 3)
+
+#. Figure 3C - Non-Inc Richness across Site
+C_N_rewet_ni_sr <- make_plot(sc.d.2[sc.d.2$Incubation=="t5",], Site, ni_richness) + 
+  ylab("") + xlab("") + ylim(50,550) + labs(tag = "C")
+#. Figure 3F - Non-inc FPD across Site
+F_N_rewet_ni_fpd <- make_plot(sc.d.2[sc.d.2$Incubation=="t5",], Site, ni_fpd) + 
+  ylab("") + xlab("") + ylim(2,13) + labs(tag = "F") 
+
+#. Figure 3D - change in total richness across sites
+D_change_total_sr<-make_plot(sc.d[sc.d$Incubation=="t5",], Site, total_richness) + 
+  ylab("") + xlab("")  + labs(tag = "D") 
+#. Figure 3G - change in total FPD across sites
+G_change_total_fpd <- make_plot(sc.d[sc.d$Incubation=="t5",], Site, total_fpd) + 
+  ylab("") + xlab("")  + labs(tag = "G") 
+
+grid.arrange(B_inc_sr, C_N_rewet_ni_sr, D_change_total_sr, 
+             E_inc_fpd, F_N_rewet_ni_fpd, G_change_total_fpd,
+             nrow=2)
+
+```
+
+## 6. calculate average EAF for each taxa at each site
+```{r EAF_by_phylum}
+
+colors<-c("#7698FF", "#18d2ad", "#affb42") #PB, WC, MC
+
+library(reshape2)
+library(ggplot2)
+library(ggforce)
+
+## 1. Melt feature table
+ft_long <- melt(as.matrix(ft.t.inc))
+colnames(ft_long) <- c("Taxon", "Sample", "EAF")
+
+## 2. Add Site info
+site_lookup <- setNames(inc.env.pre$Site, inc.env.pre$Shrub)
+ft_long$Site <- site_lookup[as.character(ft_long$Sample)]
+
+## 3. Add Phylum info
+phy_lookup <- tt.t$Phylum
+names(phy_lookup) <- rownames(tt.t)
+ft_long$Phylum <- phy_lookup[as.character(ft_long$Taxon)]
+
+## 4. Clean data: remove NA and zero EAF
+ft_long <- ft_long[!is.na(ft_long$EAF) &
+                   !is.na(ft_long$Site) &
+                   !is.na(ft_long$Phylum) & ft_long$EAF > 0, ]
+
+## Order Site levels and labels for correct colors + spacing
+ft_long$Site <- factor(ft_long$Site,
+                       levels = c("PB", "WC", "MC"),
+                       labels = c("Low", "Mid", "High"))
+
+## 5. Average EAF per Taxon per Site
+ft_mean <- aggregate(EAF ~ Taxon + Site + Phylum, data = ft_long, FUN = mean, na.rm = TRUE)
+## 5. Transform EAF
+ft_mean$logEAF <- log10(ft_mean$EAF)
+anova(lm(EAF~Site*Phylum, data=ft_mean))
+
+
+#  calculate by shrub
+ft_mean_2 <- aggregate(EAF ~ Site + Sample + Phylum, data = ft_long, FUN = mean, na.rm = TRUE)
+anova(lm(EAF~ Phylum * Site, data=ft_mean_2))
+
+## 6. Plot taxon means (each point = a taxon’s mean within that site)
+EAF <- ggplot(ft_mean, aes(x = Site, y = EAF, color = Site, fill = Site)) +
+  geom_violin(trim = FALSE, alpha = 0.20, width = 1.0, color = NA) +
+    geom_sina(size = 0.7, alpha = 0.25) +
+
+  geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.25, color = "black") +
+  scale_color_manual(values = colors, name = "Site") +
+  scale_fill_manual(values = colors, name = "Site") + xlab(" ") +
+  theme_bw() + labs(y= "Average Excess Atom Fraction", tag = "A") +
+  theme(panel.grid = element_blank(),
+        strip.text = element_text(size = 15),
+        text = element_text(size = 15),
+        legend.position = "none") +
+  coord_cartesian(ylim = c(0, 1.35)) + 
+  stat_compare_means(comparisons = list(c("Low","Mid"), c("Low","High"), c("Mid","High")),
+                      method = "t.test", size = 6, label = "p.signif", hide.ns = TRUE,
+                      p.adjust.method = "tukey") 
+```
+
+## 7. plot all of that together 
+```{r fig_2}
+#load("~/Documents/Projects/nspiral_nsip/RData/density_plot.RData")
+# Column titles
+col_titles <- arrangeGrob(
+  nullGrob(),
+  textGrob(expression(bold(""^15*N~"assimilator taxa"))),
+  textGrob("Non-assimilator taxa", gp = gpar(fontface = "bold")),
+  textGrob(expression(atop(
+                           bold(Delta ~ "All taxa after"),
+                           bold(""^15*NH[4]^"+" ~ "incubation")
+                           ))), 
+  nrow = 1, widths = c(0.5, 2, 2, 2)
+)
+
+# Row titles for the right panel
+row_titles <- arrangeGrob(
+  textGrob("Species Richness", gp = gpar(fontface = "plain"), rot = 90),
+  textGrob("Faith's Phylogenetic Diversity", gp = gpar(fontface = "plain"), rot = 90),
+  ncol = 1
+)
+
+# 3x2 grid of smaller plots
+small_plots <- arrangeGrob(
+ B_inc_sr, C_N_rewet_ni_sr, D_change_total_sr, 
+ E_inc_fpd, F_N_rewet_ni_fpd, G_change_total_fpd,
+  nrow = 2
+)
+
+# Right panel: row labels + 2x2 plots
+right_panel <- arrangeGrob(
+  col_titles,
+  arrangeGrob(
+    row_titles,
+    small_plots,
+    ncol = 2,
+    widths = c(0.5, 10)
+  ),
+  ncol = 1,
+  heights = c(1, 10)
+)
+
+# Left panel: EAF plot with no extra decoration
+left_panel <- arrangeGrob(EAF)
+
+# Combine left and right
+main <- arrangeGrob(
+  left_panel,
+  right_panel,
+  ncol = 2,
+  widths = c(1, 1.75)   # EAF panel takes 1/3, small plots take 2/3
+)
+
+# Add shared x-axis label at bottom
+grid.arrange(
+  main,
+  textGrob("N-deposition and Precipitation", gp = gpar(fontface = "bold")),
+  ncol = 1,
+  heights = c(10, 0.5)
+)
+
+```
+
+## 8. plot richness models
+```{r plot_richness_F4}
+
+model<-lm(inc.env.pre$MBN ~ inc.env.H2O$MBN)
+anova(model)
+model<-lm(inc.env.pre$MBN ~ inc.env.NH4$MBN)
+anova(model)
+
+a<-ggplot() +
+  ## H2O
+  geom_point( data = inc.env.H2O, size=3, aes(x = inc.env.pre$MBN, y = MBN, color = Site), alpha = 0.7 ) +
+  geom_smooth(data = inc.env.H2O,color="black", 
+    aes(x = inc.env.pre$MBN, y = MBN, linetype="H2O" ), method = "lm", se = FALSE, linewidth = 1) +
+  ## NH4
+  geom_point( data = inc.env.NH4, size=3, aes(x = inc.env.pre$MBN, y = MBN, color = Site), alpha = 0.7  ) +
+  geom_smooth(data = inc.env.NH4, color="black",  
+    aes(x = inc.env.pre$MBN, y = MBN, linetype="NH4"), method = "lm", se = FALSE, linewidth = 1 ) +
+  theme_bw() + theme(panel.grid = element_blank(),text = element_text(size = 13), legend.position="left") +
+  scale_color_manual(values = colors,labels = c("PB" = "Low", "WC" = "Mid", "MC" = "High")) +
+  scale_linetype_manual(name = "Rewetting\nTreatment",  values = c("H2O" = "solid", "NH4" = "dotted"))+
+  labs( x = "MBN in dry soil (ug N /g soil)", y = "MBN in rewet soil (ug N /g soil)", color = "N-dep and\nMAP") +
+  annotate("text", x = Inf, y = Inf, label = "H2O:F[1,8]= 8.923, p=0.02\n NH4:F[1,8]= 11.721, p=0.009", size = 4, vjust = 2, hjust=1.1) + labs(tag = "A") 
+
+#. nitate models
+model<-lm(inc.env.NH4$MBN ~ inc.env.NH4$NO3)
+anova(model)
+model<-lm(inc.env.H2O$MBN ~ inc.env.H2O$NO3)
+anova(model)
+model<-lm(inc.env.NH4$MBC ~ inc.env.NH4$NO3)
+anova(model)
+model<-lm(inc.env.H2O$MBC ~ inc.env.H2O$NO3)
+anova(model)
+
+
+model<-lm(MBN ~ PD_ASV_inc, data=inc.env.pre)
+anova(model)
+model<-lm(inc.env.NH4$MBN ~ inc.env.pre$PD_ASV_inc)
+anova(model)
+b<-ggplot(inc.env.pre, aes(x = MBN, y = PD_ASV_inc)) +
+     geom_point(aes(color = Site), size=3) + 
+     geom_smooth(method = "lm", level = 0.68, color = "grey") +  # one trendline for all
+     scale_color_manual(values = colors,labels = c("PB" = "Low", "WC" = "Mid", "MC" = "High")) +
+     theme_bw() + theme(text = element_text(size = 13), panel.grid = element_blank()) +
+     theme(legend.position = "none")+
+     annotate("text", x = Inf, y = Inf, label = "F[1,8]= 7.273, p=0.03", size = 4, vjust = 2, hjust=1.1) + 
+    labs(tag = "B") +
+    xlab("MBN in dry soil (ug N /g soil)") + 
+     ylab("Faith's PD of N Incorporators")   
+
+model<-lm(pH_dry ~ GenusRich_ASV_inc, data=inc.env.pre)
+anova(model)
+c<-ggplot(inc.env.pre, aes(x = pH_dry, y = Rich_ASV_inc)) +
+     geom_point(aes(color = Site), size=3) + 
+     geom_smooth(method = "lm", level = 0.68, color = "grey") +  # one trendline for all
+     scale_color_manual(values = colors,labels = c("PB" = "Low", "WC" = "Mid", "MC" = "High")) +
+     theme_bw() + theme(text = element_text(size = 13), panel.grid = element_blank()) +
+     theme(legend.position = "none") +
+     annotate("text", x = Inf, y = Inf, label = "F[1,8]= 6.4024, p=0.04", size = 4, vjust = 2, hjust=1.1) + 
+     xlab("pH of dry soil") + labs(tag="C") + 
+     ylab("Richness of 15N Incorporators")
+grid.arrange(a,b,c,nrow=1,widths=c(1.2,0.75,0.75))
+
+
+model<-lm(pH_dry ~ ni_richness, data=sc.d[sc.d$Treatment=="Pre",])
+anova(model)
+d<-ggplot(sc.d[sc.d$Treatment=="Pre",], aes(x = pH_dry, y = total_richness)) +
+     geom_point(aes(color = Site), size=3) + 
+     geom_smooth(method = "lm", level = 0.68, color = "grey") +  # one trendline for all
+     scale_color_manual(values = colors,labels = c("PB" = "Low", "WC" = "Mid", "MC" = "High")) +
+     theme_bw() + theme(text = element_text(size = 13), panel.grid = element_blank()) +
+     theme(legend.position = "none") +
+     annotate("text", x = Inf, y = Inf, label = "F[1,8]= 5.9074, p=0.04", size = 4, vjust = 2, hjust=1.1) +
+     xlab("pH of dry soil") + labs(tag="C") + 
+     ylab("Richness of total prokaryotic community")
+grid.arrange(a,b,d,nrow=1,widths=c(1.2,0.75,0.75))
+
+#. plots that show the non-incorporator diversity is not correlated to MBN dynamics
+model<-lm(MBN ~ ni_fpd, data=sc.d[sc.d$Treatment=="Pre",])
+anova(model)
+ggplot(sc.d[sc.d$Treatment=="Pre",], aes(x = MBN, y = ni_fpd)) +
+     geom_point(aes(color = Site), size=3) + 
+     geom_smooth(method = "lm", level = 0.68, color = "grey") +  # one trendline for all
+     scale_color_manual(values = colors,labels = c("PB" = "Low", "WC" = "Mid", "MC" = "High")) +
+     theme_bw() + theme(text = element_text(size = 13), panel.grid = element_blank()) +
+     theme(legend.position = "none") +
+     annotate("text", x = Inf, y = Inf, label = "F[1,8]= 2.6898, p=0.132", size = 4, vjust = 2, hjust=1.1) 
+model<-lm(MBN ~ ni_fpd, data=sc.d[sc.d$Treatment=="NH4",])
+anova(model)
+ggplot(sc.d[sc.d$Treatment=="NH4",], aes(x = MBN, y = ni_fpd)) +
+     geom_point(aes(color = Site), size=3) + 
+     geom_smooth(method = "lm", level = 0.68, color = "grey") +  # one trendline for all
+     scale_color_manual(values = colors,labels = c("PB" = "Low", "WC" = "Mid", "MC" = "High")) +
+     theme_bw() + theme(text = element_text(size = 13), panel.grid = element_blank()) +
+     theme(legend.position = "none") +
+     annotate("text", x = Inf, y = Inf, label = "F[1,8]= 0.0467, p=0.8338", size = 4, vjust = 2, hjust=1.1) 
+
+model<-lm(MBC ~ ni_fpd, data=sc.d[sc.d$Treatment=="Pre",])
+anova(model)
+model<-lm(MBC ~ ni_fpd, data=sc.d[sc.d$Treatment=="NH4",])
+anova(model)
+model<-lm(MBC ~ ni_richness, data=sc.d[sc.d$Treatment=="Pre",])
+anova(model)
+model<-lm(MBC ~ ni_richness, data=sc.d[sc.d$Treatment=="NH4",])
+anova(model)
+
+model<-lm(pH_dry ~ Rich_ASV_inc, data=inc.env.pre)
+anova(model)
+
+```
+
+## 9. Make a tree showing the pagel L and coloring branches by Phylum
+```{r fix_tree}
+
+library(ggtree)
+library(ggtreeExtra)
+library(treeio)
+library(tidytree)
+library(ggplot2)
+library(ggnewscale)
+library(ape)
+library(phangorn)
+library(phytools)
+library(cowplot)
+library(phytools)
+
+## Make sure tree and feature table are aligned to the same ASVs
+common_asv <- intersect(tree$tip.label, rownames(ft.t.inc))
+tree_pruned <- drop.tip(tree, setdiff(tree$tip.label, common_asv))
+ft.inc      <- ft.t.inc[tree_pruned$tip.label, , drop = FALSE]  # reorder rows to match tree
+
+# 1. Get all Proteobacteria tip labels
+proteo_tips <- rownames(tt.t[tt.t$Phylum == "Proteobacteria" & 
+                 rownames(tt.t) %in% tree_pruned$tip.label,])
+
+# 2. Find the MRCA node of all Proteobacteria
+proteo_mrca <- findMRCA(tree_pruned, proteo_tips)
+
+# 3. Get all descendants of that node
+proteo_descendants <- getDescendants(tree_pruned, proteo_mrca)
+
+# 4. Convert node numbers to tip labels (tips have node numbers <= Ntip)
+proteo_tip_nodes <- proteo_descendants[proteo_descendants <= Ntip(tree_pruned)]
+proteo_clade_tips <- tree_pruned$tip.label[proteo_tip_nodes]
+
+# 5. Find Bacteroidota tips that fall within that clade
+misplaced <- rownames(tt.t[tt.t$Phylum == "Bacteroidota" & 
+                rownames(tt.t) %in% proteo_clade_tips,])
+
+tt.t[misplaced, "Phylum"] <- "Proteobacteria"  # correct
+```
+
+```{r tree}
+
+##  15 colors
+phylum_colors <- c(
+  "#F49AC2",
+  "palevioletred",
+  "#FF7F7F", 
+  "#FFA07A",
+  "#FFB347",
+  "#FDD835",
+  "#A3D977",
+  "#66CDAA", 
+  "#84DCCF", 
+  "cadetblue1",
+  "#6FB1FC", 
+  "plum1",
+  "#CAB2D6",
+  "chartreuse1",
+  "magenta1"
+)
+
+## all phyla in the taxonomy table
+all_phyla <- sort(unique(na.omit(tt.t$Phylum)))
+all_phyla <- all_phyla[!(all_phyla%in%c("Bdellovibrionota", "Cyanobacteria", "Sumerlaeota", "Patescibacteria", "Deinococcota", "Unassigned"))]
+length(all_phyla)
+## global named palette: SAME mapping for every site
+phylum_cols <- setNames(phylum_colors[seq_along(all_phyla)], all_phyla)
+phylum_cols
+
+make_site_tree_phylum_eaf <- function(site_id,
+                                      show_legends = TRUE,
+                                      bar_pwidth = 0.60,
+                                      bar_width  = 0.90) {
+
+  require(ggplot2)
+  require(ggtree)
+  require(ggtreeExtra)
+  require(treeio)
+  require(tidytree)
+  require(ggnewscale)
+  require(ape)
+  require(phytools)
+  require(scales)
+
+  ## 1) samples for this site
+  if (site_id == "ALL") {
+    samples_site <- inc.env.pre$Shrub
+  } else {
+    samples_site <- inc.env.pre$Shrub[inc.env.pre$Site == site_id]
+  }
+  samples_site <- intersect(samples_site, colnames(ft.inc))
+  if (length(samples_site) < 2L) stop("Not enough samples for site ", site_id)
+
+  ## 2) site-mean EAF per taxon
+  ft_site  <- ft.inc[, samples_site, drop = FALSE]
+  eaf_mean <- rowMeans(ft_site, na.rm = TRUE)
+  eaf_mean[is.nan(eaf_mean)] <- NA
+  eaf_mean[eaf_mean <= 0] <- NA
+
+  ## 3) keep taxa with EAF and Phylum
+  keep_tips <- names(eaf_mean)[!is.na(eaf_mean)]
+  keep_tips <- intersect(keep_tips, tree_pruned$tip.label)
+
+  has_phy <- !is.na(tt.t[keep_tips, "Phylum"])
+  keep_tips <- keep_tips[has_phy]
+  if (length(keep_tips) < 5L) stop("Not enough taxa with EAF+Phylum for site ", site_id)
+
+  ## 4) prune + ladderize
+  tree_site <- drop.tip(tree_pruned, setdiff(tree_pruned$tip.label, keep_tips))
+  tree_site <- ladderize(tree_site, right = TRUE)
+
+  ## 5) fix tree artifacts
+  if (!is.binary(tree_site)) tree_site <- multi2di(tree_site)
+  if (is.null(tree_site$edge.length)) tree_site$edge.length <- rep(1, nrow(tree_site$edge))
+  if (any(tree_site$edge.length == 0)) tree_site$edge.length[tree_site$edge.length == 0] <- 1e-6
+
+  ## 6) Faith's PD
+  faith_pd <- sum(tree_site$edge.length, na.rm = TRUE)
+
+  ## 7) Pagel's lambda
+  eaf_tip <- eaf_mean[tree_site$tip.label]
+  eaf_tip <- eaf_tip[is.finite(eaf_tip) & !is.na(eaf_tip)]
+
+  trait_var <- stats::var(eaf_tip, na.rm = TRUE)
+  if (is.na(trait_var) || trait_var == 0) {
+    L_res <- list(lambda = NA_real_, P = NA_real_)
+  } else {
+    L_res <- tryCatch(
+      phytools::phylosig(tree_site, eaf_tip, method = "lambda", test = TRUE),
+      error = function(e) list(lambda = NA_real_, P = NA_real_)
+    )
+  }
+
+  subtitle_txt <- paste0(
+    "\nPagel’s λ = ", formatC(L_res$lambda, format = "f", digits = 3),
+    " (p = ", formatC(L_res$P, format = "e", digits = 2), ")"
+  )
+
+  ## 8) node data with Phylum
+  td <- treeio::as_tibble(tree_site)
+  n_tips <- Ntip(tree_site)
+
+  phy_tips <- tt.t[tree_site$tip.label, "Phylum"]
+  names(phy_tips) <- tree_site$tip.label
+
+  td$Phylum <- NA_character_
+  tip_rows <- td$node <= n_tips
+  td$Phylum[tip_rows] <- phy_tips[td$label[tip_rows]]
+
+  for (node in (n_tips + 1):max(td$node)) {
+    desc_idx    <- Descendants(tree_site, node, type = "tips")[[1]]
+    desc_labels <- tree_site$tip.label[desc_idx]
+    ph          <- unique(na.omit(phy_tips[desc_labels]))
+    td$Phylum[td$node == node] <- if (length(ph) == 1L) ph else NA_character_
+  }
+
+  ## 9) EAF bar-panel data
+  eaf_df <- data.frame(
+    ID     = tree_site$tip.label,
+    EAF    = as.numeric(eaf_mean[tree_site$tip.label]),
+    logEAF = -log10(as.numeric(eaf_mean[tree_site$tip.label])),
+    stringsAsFactors = FALSE
+  )
+  eaf_df <- eaf_df[is.finite(eaf_df$logEAF) & !is.na(eaf_df$ID), , drop = FALSE]
+
+  ## 10) plot
+  p <- ggtree(
+      tree_site,
+      layout        = "rectangular",
+      ladderize     = TRUE,
+      branch.length = "none",
+      aes(color = Phylum)
+    ) %<+% td +
+    geom_tree(size = 0.7) +
+    scale_color_manual(
+      values   = phylum_cols,
+      na.value = "grey80",
+      name     = "Phylum",
+      guide    = if (show_legends) "legend" else "none"
+    ) +
+    labs(subtitle = subtitle_txt) +
+    theme_tree2() +
+     theme(
+      plot.subtitle  = element_text(hjust = 0.5, size = 11),
+      plot.margin    = grid::unit(c(6, 8, 6, 2), "mm"),  # increase bottom margin
+      axis.text.x    = element_blank(),
+      axis.ticks.x   = element_blank(),
+      axis.line.x    = element_blank()
+    ) +
+    ggnewscale::new_scale_fill() +
+    ggtreeExtra::geom_fruit(
+      data    = eaf_df,
+      geom    = geom_col,
+      mapping = aes(y = ID, x = EAF, fill = EAF),
+      orientation = "y",
+      offset  = 0.05,   # <<< tighter tree–fruit spacing
+      pwidth  = bar_pwidth,
+    axis.params = axis_params(
+        axis       = "x",
+        text.size  = 3,
+        at         = c(0, 0.25, 0.5, 0.75, 1),
+        vjust      = 2.2,
+        hjust      = 0.5,
+        text.angle = 45,
+        line.size  = 0.2,
+        line.color = "grey40"
+      ),
+      width   = bar_width
+    ) +
+    # scale_fill_viridis_c(
+    #   name   = "Mean 15N-EAF",
+    #   option = "plasma",
+    #   trans  = "log10",
+    #   limits = c(1e-4, 1),
+    #   oob    = scales::squish,
+    #   guide  = if (show_legends) "colourbar" else "none"
+    # ) + 
+     scale_fill_gradientn(
+      name   = "Mean 15N-EAF",
+      colors = c("white", "#FF69B4", "#FF1493"),
+      limits = c(0, 1),
+      oob    = scales::squish,
+      guide  = if (show_legends) "colourbar" else "none"
+    ) +
+    coord_cartesian(clip = "off")
+
+  list(
+    plot = p,
+    stats = data.frame(
+      Site     = site_id,
+      Faith_PD = faith_pd,
+      lambda   = L_res$lambda,
+      lambda_p = L_res$P,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+#. same y-range for every panel = same height per tip
+plots  <- list(PB = p_PB$plot, WC = p_WC$plot, MC = p_MC$plot)
+n_tips <- sapply(plots, function(p) sum(p$data$isTip))
+n_max  <- max(n_tips)
+
+#. top-aligned: empty space falls below smaller trees
+plots <- Map(function(p, n)
+  suppressMessages(p + coord_cartesian(ylim = c(n - n_max + 0.5, n + 0.5), clip = "off")),
+  plots, n_tips)
+
+plot_grid(plots$PB, plots$WC, plots$MC, ncol = 3,
+          rel_widths = c(1, 1, 1.5),
+          labels = c("Low Site", "Mid Site", "High Site"),
+          label_size = 14)
+
+```
+
+## 10A. beta-disper analysis
+```{r unifrac_betadisper}
+library(vegan)
+library(GUniFrac)
+
+#  make df without NAs
+ft.t.inc.2 <- ft.t.inc
+ft.t.inc.2[is.na(ft.t.inc.2)] <- 0
+
+# 1. Calculate UniFrac distances
+unifrac_all <- GUniFrac(t(ft.t.inc.2), tree_pruned, alpha = c(0, 0.5, 1))
+
+unifrac_un <- as.dist(unifrac_all$unifracs[,, "d_UW"])  # unweighted
+unifrac_w  <- as.dist(unifrac_all$unifracs[,, "d_1"])   # weighted
+
+# 2. PERMANOVA
+meta <- inc.env.pre$Site
+permanova_un <- adonis2(unifrac_un ~ meta, permutations = 999)
+permanova_w  <- adonis2(unifrac_w  ~ meta, permutations = 999)
+
+permanova_un
+permanova_w
+
+# 3. Check dispersion
+disp_un <- betadisper(unifrac_un, meta)
+disp_w  <- betadisper(unifrac_w,  meta)
+
+permutest(disp_un)
+permutest(disp_w)
+```
+
+## 10B. UniFrac: assimilator vs non-assimilator composition and site effect
+```{r unifrac_inc_vs_ni}
+library(vegan)
+library(GUniFrac)
+library(permute)
+library(ape)
+
+#. per-sample communities from 1A (inc.m = assimilators, ni.m = non-assimilators)
+n <- length(shrubs)
+comm.g <- rbind(t(inc.m), t(ni.m))
+rownames(comm.g) <- c(paste0(shrubs, "_A"), paste0(shrubs, "_N"))
+comm.g <- comm.g[, colnames(comm.g) %in% tree.p$tip.label, drop = FALSE]
+comm.g <- comm.g[, colSums(comm.g) > 0, drop = FALSE]
+tree.g <- drop.tip(tree.p, setdiff(tree.p$tip.label, colnames(comm.g)))
+comm.g <- comm.g[, tree.g$tip.label]
+
+meta.g <- data.frame(
+  sample = rep(shrubs, 2),
+  site   = factor(c(PB = "Low", WC = "Mid", MC = "High")[substr(rep(shrubs, 2), 1, 2)],
+                  levels = c("Low", "Mid", "High")),
+  group  = factor(rep(c("Assimilator", "Non-assimilator"), each = n)),
+  row.names = rownames(comm.g)
+)
+
+#. 1. unweighted UniFrac (presence/absence)
+uf   <- GUniFrac(comm.g, tree.g, alpha = 1)$unifracs[, , "d_UW"]
+d.uw <- as.dist(uf)
+
+#. 2. PERMANOVA, permuting group labels within each soil sample
+#.    (the site row is not testable under this design; interpret group and site:group only)
+set.seed(1)
+perm <- how(nperm = 999, blocks = meta.g$sample)
+perm.uw <- adonis2(d.uw ~ site + group + site:group, data = meta.g,
+                   permutations = perm, by = "terms")
+perm.uw
+
+```
+  

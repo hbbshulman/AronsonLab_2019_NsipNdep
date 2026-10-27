@@ -1,0 +1,532 @@
+---
+title: "Calculation and evalution of 15N-DNA-SIP Data"
+author: "Hannah Shulman"
+date: "2026-10-13"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+#  0.1: Set up environment and import data
+####  lulu reduces 23562 --> 10934
+####  bokulich cutoff reduces 10834 --> 4256 taxa
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+setwd("~/Documents/Projects/nspiral_nsip")
+
+library(vegan)
+library(ggplot2)
+library(stringr)
+library(plyr)
+library(dplyr)
+library(forcats)
+library(ape)
+library(purrr)
+library(cowplot)
+library(gridExtra)
+library(ggridges)
+
+#  std dev function for plots
+std <- function(x) sd(x)/sqrt(length(x))
+
+#  Import working data
+#load("~/Documents/Projects/nspiral_nsip/homebrew_input_clean.RData")
+load("~/Documents/Projects/nspiral_nsip/1_qsip_homebrew.RData") 
+
+#. ft = un-normalized feature table made from LULU-merged ASVs
+#. ft.t = un-normalized feature table that has been trimmed of low-abundance reads and contaminants, made from LULU-merged ASVs
+#. ft.clustered = ft, but phylogenetically clustered at h=0.03
+#. md = sample metadata which includes qPCR
+#. Sdat = additional data about soil sampling, for N assimilated calculations
+#. tree = phylogenetic tree matching ft 
+#. tt = taxatable matching ft, SILVA 138
+#. tt.t = taxatable matching ft.t, SILVA 138
+#. tt.clustered = taxtable matching ft.clustered, SILVA 138
+```
+
+#  0.2: Define 
+#### Define taxa, fractions, unique tubes, and unique samples
+#### each unique (soil) sample was used to incubate both heavy and light isotopes (3 unique tubes per sample including the dry pretreatment soil) and fractionated (set of fractions per unique tube)
+####  *we are missing MCs09_t168_14N & WCs12_t168_15N because of bad centrifuge results
+```{r define, warming=FALSE}
+#. TSS scale the data
+ft.tss <- decostand(ft.t, MARGIN=2, method="total")
+
+taxa <- row.names(ft.tss) # taxa hashes
+fraction <- colnames(ft.tss) # sample.fraction names
+unique.tube <- unique(md$unique_tube) # sample (shrub x incubation)
+unique.sample <- unique(md$replicate) # shrub
+
+#  how many fractions per unique tube? - should all be the same
+print(table(md$unique_tube))
+```
+
+# The following steps are numbered based on the calculation table 
+
+#  Step 1: Calculate Y(ijk)  
+### the total number of 16S copies of a single taxon i in a single fraction k in replicate jis calculated as the proportional abundance of i within k (determined by sequencing) times the total copies of 16S gene copies in that fraction (determined through qPCR). 
+```{r step1, warning=FALSE}
+#  copy ft
+ft.1 <- ft.tss
+#  check colsums = 1 (should be FALSE) 
+FALSE%in%(1%in%colSums(ft.1))
+# go through each column and multiply it by the 16S copy number in the metadata file
+for(i in 1:length(fraction)){ #  for each columns of ft.1, which represents  fractions
+  ft.1[,i] <- ft.1[,i]* md[fraction[i],]$copies.ul #  multiple rel abundance in column by total copies 
+}
+rm(i)
+#  check that it worked for one column -- the two numbers should be the same
+sum(ft.1[,1])
+md[row.names(md)==fraction[1],]$copies.ul
+```
+### each cell in ft.1 represents the number of 16S copies of that taxa in that fraction
+
+#  Step 2: Calculate Y(ij)
+### The sum of the total number of genes copies of taxon i across all k fractions in replicate j 
+```{r step2, warning=FALSE}
+#  construct new ft with taxa as rows and unique tubes as columns
+ft.2 <- data.frame(matrix(data=NA, nrow=length(taxa), ncol=length(unique.tube)))
+row.names(ft.2) <- taxa
+colnames(ft.2) <- unique.tube
+
+#  sum all fractions and put into new column
+for(i in 1:length(unique.tube)){ #  for each unique tube
+  fracs <- row.names(md[md$unique_tube==unique.tube[i],])#  pull  list of fractions
+  ft.2[,i] <- rowSums(ft.1[,colnames(ft.1)%in%fracs])
+}
+
+rm(i,fracs)
+```
+### each cell in ft.2 represent the total copies of each taxa's 16S found across all fractions for each unique tube (unique soil sample +  incubation treatment)
+
+#  Step 3: Calculate W(ij)
+### The total density of taxon i across all k fractions of replicate j (Wij) is the sum of proportional densities, calculated by multiplying the density x in each fraction by the proportional gene copies in each fraction (yijk / yij)
+```{r step3, warning=FALSE}
+#  3a - calculate proportional gene copies for each taxon in each fraction 
+#  each cell in ft.3a represents the percentage of total gene copies observed across all fractions for a taxa, that are seen in that fraction
+ft.3a <- ft.1
+for(i in 1:length(fraction)){ #  for each fraction
+  this.ut<-md[fraction[i],]$unique_tube #  find the tube that fraction belongs too
+  ft.3a[,i] <- ft.3a[,i]/ft.2[,this.ut] # (divide ft.1 by the corresponding column in ft.2)
+}
+ft.3a[ft.3a=="NaN"]<-0 # we get NaNs when a taxa is absent in a fraction and we try to divide it by total gene copies, so just set them to zero
+rm(i,this.ut)
+
+#  3b - multiply those proportional gene copies by the density of each fraction to get proportional density 
+#  here we are applying the density value for each tube to each taxa in it 
+ft.3b <- ft.3a 
+for(i in 1:length(fraction)){
+  ft.3b[,i] <- ft.3b[,i]* as.numeric(md[fraction[i],]$Density)}           
+
+#  3c - sum the proportional densities
+ft.3c <- ft.2
+for(i in 1:length(unique.tube)){
+  fracs <- row.names(md[md$unique_tube==unique.tube[i],]) #  pull  list of fractions
+  ft.3c[,i] <- rowSums(ft.3b[,colnames(ft.3b)%in%fracs])
+}
+rm(fracs,i)
+```
+### each cell in ft.3c represents the total density of each taxon across all fractions in a unique tube
+
+#  Steps 4-9: calculate EAF - takes about 10 sec per sample to run
+```{r EAF, warning=FALSE}
+#  remove the samples that don't have pairs
+unique.sample <- unique.sample[!unique.sample%in%c("MCs09", "WCs12")]
+#  construct a df where taxa are rows and unique samples are columns
+ft.eaf <- data.frame(matrix(data=NA, nrow=length(taxa), ncol=length(unique.sample)))
+row.names(ft.eaf) <- taxa
+colnames(ft.eaf) <- unique.sample
+
+#  copy dfs for other values
+ft.Mlight <-ft.eaf
+ft.Mlabmax <-ft.eaf
+ft.Mlab <-ft.eaf
+ft.Zi<-ft.eaf
+
+for(i in 1:length(unique.sample)){
+#  first, get the light and labeled sample ids
+  light <- unique(md[md$replicate==unique.sample[i] & md$Isotope=="14N" & md$Hour =="t168",]$unique_tube)
+  lab <- unique(md[md$replicate==unique.sample[i] & md$Isotope=="15N" & md$Hour =="t168",]$unique_tube)
+  for(j in 1:length(taxa)){
+    #  retrieve densities
+    Wlight<-ft.3c[j,light]
+    Wlab<-ft.3c[j,lab]
+    if(Wlight * Wlab == 0){ft.eaf[j,i]<-"NIBI"} #  taxa not in both incubations
+    if(Wlight + Wlab == 0){ft.eaf[j,i]<-"NIS"} # taxa not in either incubation of sample
+    if(Wlight > 0 & Wlab > 0){
+      #  STEP 4. calculate change in density
+      Zi = Wlab-Wlight
+      ft.Zi[j,i]<-Zi
+      #  STEP 5. calculate GC content
+      Gi = (1/0.083506)*(Wlight - 1.646057) # hungate
+      #  5b. calculate N atoms - from morrissey 2018
+      #hNi = (0.5*Gi + 3.5)
+      #  6. calculate natural molecular weight of the DNA sequence
+      Mlight = (0.496*Gi + 307.691)
+      #  7. theoretical maximum of labeled molecular weight
+      Mlabmax = ((0.5024851*Gi) + 3.5173961 + Mlight)
+      #  8. observed labeled molecular weight of the DNA sequence
+      Mlab = (((Zi/Wlight) + 1) * Mlight)
+      #  9. EAF
+      EAF = ((Mlab-Mlight) / (Mlabmax-Mlight) * (1-0.003663004))
+      ft.eaf[j,i] <- EAF
+      ft.Mlight[j,i]<-Mlight
+      ft.Mlab[j,i]<-Mlab
+      ft.Mlabmax[j,i]<-Mlabmax
+    }
+  }            
+}
+
+#  make a second version of the EAF table with characters and negatives replaced by zeros
+ft.eaf.n <- ft.eaf
+ft.eaf.n[ft.eaf.n == "NIBI"] <- NA
+ft.eaf.n[ft.eaf.n == "NIS"] <- NA
+```
+
+#  Step 10A validate incorporators 
+#### Here we correct values in ft.eaf that weren't in enough fractions to properly calculate EAF. It's important that these taxa were included when calculating the fractional densities and 16S abundances, because they were present in the tubes take up proportional density/gene abundance. 
+```{r validate_1, warning=FALSE}
+#  10.1 melt and annotate data
+## ft.tss: matrix or data.frame with ASV IDs as rownames and samples as colnames
+ft.tss.m <- data.frame(ASV = rownames(ft.tss)[row(ft.tss)], Sample = colnames(ft.tss)[col(ft.tss)], 
+                       value  = as.vector(as.matrix(ft.tss)), stringsAsFactors = FALSE)
+## parse metadata
+meta <- strcapture(
+  pattern = "^([A-Z]{2})(s[0-9]{2})(t[0-9p]+)_f([0-9]+)$",
+  x       = ft.tss.m$Sample,
+  proto   = list(Site     = character(), Plot= character(),Time = character(),Fraction = integer()))
+ft.tss.m <- cbind(ft.tss.m, meta)
+ft.tss.m$Fraction <- factor(ft.tss.m$Fraction, levels=c(4,5,6,7,8,9,10,11,12,13,14,15,16,17))
+## this dataframe gives us a unique row for every instance of every taxa in every fraction
+ft.tss.m[1:5,]
+
+#  10.2 Aggregate that to tell us how many fractions each taxa appears in for each shrub/sample
+ft.tss.m$SitePlot <- paste0(ft.tss.m$Site, ft.tss.m$Plot) ## Make SitePlot
+nz <- ft.tss.m[ft.tss.m$value > 0, c("ASV", "SitePlot", "Time")] ## Keep only non-zero entries
+nz$count <- 1L ## Count # of non-zero values per ASV × SitePlot × Time
+agg <- aggregate(count ~ ASV + SitePlot + Time, 
+                 data = nz, FUN = sum) # Reshape to wide: 1 row per ASV × SitePlot, cols for each Time
+summary.table <- reshape(agg, idvar   = c("ASV", "SitePlot"),timevar = "Time", direction = "wide") ## Clean up col names
+names(summary.table) <- sub("^count\\.", "", names(summary.table)) ## Replace NAs (no observations for that Time) with 0
+summary.table[is.na(summary.table)] <- 0 # subset so that ASVs need to have 1 occurance in both isotope incubation gradients
+summary.table2<-summary.table[summary.table$t4 >=1 & summary.table$t5 >=1,]
+length(unique(summary.table2$ASV)) 
+# this dataframe contains all the occurances that can actually be analyzed for EAF. Here we get 1311, which is about 25% of observed taxa
+summary.table2[1:5,]
+
+#  10.3 Filter incorporator table
+ft.eaf.n2 <- ft.eaf.n 
+## Build lookup of valid ASVs per SitePlot
+valid_list <- split(summary.table2$ASV, summary.table2$SitePlot)
+## Loop through each SitePlot column in ft.inc2
+for (sp in colnames(ft.eaf.n2)) {
+  col_vals <- ft.eaf.n2[, sp]
+  valid_asv <- valid_list[[sp]]
+  if (is.null(valid_asv)) {
+    ## zero out  non-NA, non-zero entries if they dont have occurance in both incubations
+    idx <- !is.na(col_vals) & col_vals != 0 
+  } else {
+    ## ASV is invalid if not listed for this SitePlot
+    idx <- !(rownames(ft.eaf.n2) %in% valid_asv) &
+           !is.na(col_vals) & col_vals != 0}
+    ft.eaf.n2[idx, sp] <- NA}
+## Identify rows that have at least one non-zero, non-NA value
+keep <- apply(ft.eaf.n2, 1, function(x) any(!is.na(x) & x != 0))
+## Subset ft.inc2 in place
+ft.eaf.n2 <- ft.eaf.n2[keep, , drop = FALSE]
+#. make sure its numeric 
+rn <- row.names(ft.eaf.n2)
+ft.eaf.n2 <-as.data.frame(lapply(ft.eaf.n2, as.numeric), row.names=rn)
+
+#  10.4 fix outlier values and negatives
+#  i would like to min-max scale the data, look at distribution to justify
+# Melt ft.eaf.n2 to long format
+eaf_long <- data.frame(
+  ASV      = rownames(ft.eaf.n2)[row(ft.eaf.n2)],
+  SitePlot = colnames(ft.eaf.n2)[col(ft.eaf.n2)],
+  EAF      = as.vector(as.matrix(ft.eaf.n2)),
+  stringsAsFactors = FALSE)
+# Merge into summary.table2
+summary.table3 <- merge(summary.table2, eaf_long, by = c("ASV", "SitePlot"), all.x = TRUE)
+#. fix negatives - anything below zero is just 0
+ft.eaf.n2[ft.eaf.n2 < 0] <- 0
+ft.eaf.n2 <- ft.eaf.n2[!apply(ft.eaf.n2, 1, function(x) all(is.na(x) | x == 0)), ]
+#. min-max scale
+rng <- range(ft.eaf.n2, na.rm = TRUE)
+ft.eaf.n2 <- (ft.eaf.n2 - rng[1]) / (rng[2] - rng[1])
+#. for ft.t, 877 incorporators at threshold = 1, 512 at threshold = 2
+ft.t.inc <- ft.eaf.n2
+```
+
+```{r validate_2, warning=FALSE, echo=FALSE, include=FALSE}
+## Step 10B, generate plots to show EAF spread/error  
+
+## Wrangle data
+library(lmerTest)
+site <- function(d) factor(substr(d$SitePlot, 1, 2))
+# Average relative abundance per ASV × SitePlot (across all fractions, including zeros)
+avg_rel_abund <- aggregate(value ~ ASV + SitePlot, data = ft.tss.m, FUN = mean)
+# Merge with fraction count table (summary.table2 has t4 = # fractions in 15N gradient)
+# Using total fractions across both isotope gradients as a proxy for "spread"
+summary.table2$total_fracs <- summary.table2$t4 
+plot_df <- merge(avg_rel_abund, summary.table2[, c("ASV", "SitePlot", "total_fracs")],
+                 by = c("ASV", "SitePlot"))
+
+
+## Plots
+S5A<-ggplot(data = subset(summary.table3, !is.na(EAF)), 
+       aes(x = as.factor(t4), y = EAF)) +
+  geom_point(alpha = 0.15, size = 0.8, color = "gray40") +
+  stat_summary(fun = mean, geom = "point", size = 2.5) +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3) +
+  theme_bw() + 
+  labs(x = "Fraction occupancy for 15N samples", y = "Excess Atom Fraction") + 
+  ggtitle("A: Mean EAF and EAF noise vs fraction occupancy of 16S reads") + 
+  annotate("text", label="Variance: z = −15.1, p < 0.001; \nMean: χ² = 14.8, p < 0.001",
+           x = Inf, y = Inf,hjust = 1.1, vjust = 1.5, size = 4)
+
+
+
+## wrangle data for more plotting
+# Melt raw feature table (ft.t = trimmed but un-normalized)
+ft.t.m <- data.frame(
+  ASV      = rownames(ft.t)[row(ft.t)],
+  Sample   = colnames(ft.t)[col(ft.t)],
+  value    = as.vector(as.matrix(ft.t)),
+  stringsAsFactors = FALSE)
+meta3 <- strcapture(
+  pattern = "^([A-Z]{2})(s[0-9]{2})(t[0-9p]+)_f([0-9]+)$",
+  x       = ft.t.m$Sample,
+  proto   = list(Site = character(), Plot = character(), Time = character(), Fraction = integer()))
+ft.t.m <- cbind(ft.t.m, meta3)
+ft.t.m$SitePlot <- paste0(ft.t.m$Site, ft.t.m$Plot)
+# Average raw reads across fractions per ASV × SitePlot
+avg_reads <- aggregate(value ~ ASV + SitePlot, data = ft.t.m, FUN = sum)
+# Merge with fraction count
+plot_df3 <- merge(avg_reads, summary.table2,
+                  by = c("ASV", "SitePlot"))
+
+plot_df4 <- merge(avg_reads, summary.table3,
+                  by = c("ASV", "SitePlot"))
+#  add site 
+summary.table3$Site <- factor(substr(summary.table3$SitePlot, 1, 2))
+plot_df3$Site       <- factor(substr(plot_df3$SitePlot, 1, 2))
+plot_df4$Site       <- factor(substr(plot_df4$SitePlot, 1, 2))
+
+#  Figure S5B
+S5B<-ggplot(plot_df3, aes(x = as.factor(t4), y = value)) +
+  geom_point(alpha = 0.15, size = 0.7, color = "gray40") +
+  stat_summary(aes(group = t4), fun = mean, geom = "point",
+               color = "black", size = 2) +
+   stat_summary(aes(group = t4), fun.data = mean_se, geom = "errorbar",
+               color = "black", width = 0.3) +
+  theme_bw() +
+  scale_y_log10()+
+  labs(x = "Fraction occupancy for 15N samples",
+       y = "Cumulative raw read count",
+       title = "B: Rare taxa have lower fraction occupancy") + 
+   annotate("text", label= "χ² = 305.7, p < 0.001",
+           x = Inf, y = Inf,hjust = 1.1, vjust = 1.5, size = 4)
+
+#  Figure S5C
+S5C<-ggplot(plot_df4, aes(x = value, y = EAF)) +
+  geom_point(alpha = 0.4, size = 0.7, color = "gray40") +
+  theme_bw() +
+  scale_x_log10()+
+  labs(x = "Cumulative raw read count",
+       y = "EAF",
+       title = "C: EAF vs. raw read abundance by sample") +
+     annotate("text", label= "Read depth ~ EAF: χ² = 3.16, p = 0.08\n Site effect:χ² = 1.45, p = 0.49",
+           x = Inf, y = Inf,hjust = 1.1, vjust = 1.5, size = 4)
+
+grid.arrange(S5A, S5B, S5C, ncol=1)
+
+```
+
+# Step 10B, run some models and a sensitivity analysis 
+#### here we actually look at the threshold choice and how EAF changes with read depth and fraction occupancy. Supplementary figure 5 shows the data from this analysis. 
+```{r validate_3, warning=FALSE, message=FALSE}
+## Goal: show that the permissive (>=1 fraction) threshold adds noise to EAF but no systematic bias, and that any noise is distributed evenly across sites.
+## Design used in every model:
+##   Site      = fixed effect (3 deliberately chosen gradient points)
+##   SitePlot  = random intercept (plots are replicates within site)
+##   ASV       = random intercept (the same ASV is measured in several plots)
+## Interaction terms (x * Site) test whether a relationship differs among sites.
+
+library(glmmTMB)
+library(DHARMa)
+library(emmeans)
+library(car)
+
+# ---- Analysis table ----
+## summary.table3 is built in 10.4 BEFORE negatives are set to 0 and before min-max scaling, so EAF here is the raw estimate. Raw EAF is what you need  to test for bias: truncating negatives to 0 would itself inflate the mean of noisy (low-occupancy) taxa.
+
+bias_df <- merge(summary.table3, avg_reads, by = c("ASV", "SitePlot"))
+names(bias_df)[names(bias_df) == "value"] <- "reads"
+bias_df <- subset(bias_df, !is.na(EAF))
+
+bias_df$Site      <- factor(substr(bias_df$SitePlot, 1, 2))
+bias_df$SitePlot  <- factor(bias_df$SitePlot)
+bias_df$fracs     <- bias_df$t4                      # fractions in 15N gradient
+bias_df$fracs_c   <- bias_df$fracs - mean(bias_df$fracs)
+bias_df$log_reads <- log10(bias_df$reads)
+bias_df$log_reads_c <- bias_df$log_reads - mean(bias_df$log_reads)
+bias_df$neg       <- as.integer(bias_df$EAF < 0)
+bias_df$pos       <- as.integer(bias_df$EAF > 0)
+n_frac <- 14                                          # fractions 4-17
+
+# Fig S5B: Low-abundance taxa occur in fewer fractions, so stricter thresholds would preferentially drop rare taxa.
+
+## Occupancy ~ read depth, and does that relationship differ by site?
+occ_df <- plot_df3  # all valid ASV x SitePlot
+occ_df$Site     <- factor(substr(occ_df$SitePlot, 1, 2))
+occ_df$SitePlot <- factor(occ_df$SitePlot)
+occ_df$log_reads_c <- log10(occ_df$value) - mean(log10(occ_df$value))
+
+##  run the beta-binomal model and report
+m_B <- glmmTMB(cbind(t4, n_frac - t4) ~ log_reads_c * Site + (1 | SitePlot), family = betabinomial, data = occ_df)
+Anova(m_B)                       
+emtrends(m_B, ~ Site, var = "log_reads_c")  # slope per site
+
+## What stricter thresholds would remove, by site.
+## Proportion of ASV x plot occurrences retained and richness per plot.
+thr_tab <- do.call(rbind, lapply(1:4, function(k) {
+  keep_k <- summary.table$t4 >= k & summary.table$t5 >= k
+  d <- summary.table[keep_k, ]
+  d$Site <- substr(d$SitePlot, 1, 2)
+  rich <- aggregate(ASV ~ SitePlot + Site, data = d, FUN = length)
+  data.frame(threshold = k,
+             aggregate(ASV ~ Site, data = rich, FUN = mean))
+}))
+names(thr_tab)[names(thr_tab) == "ASV"] <- "mean_richness_per_plot"
+thr_tab
+
+# S5A: Fewer fractions -> noisier EAF (error), but not shifted EAF (bias).Location-scale model: the mean part tests bias, the dispersion pars tests noise.
+m_A <- glmmTMB(EAF ~ fracs_c * Site + (1 | SitePlot) + (1 | ASV),
+               dispformula = ~ fracs_c + Site,
+               family = gaussian, data = bias_df)
+summary(m_A)
+## Conditional model: fracs_c slope ~ 0 (CI spans 0)     = no bias
+##                    fracs_c:Site ~ 0                   = same across sites
+## Dispersion model:  fracs_c slope < 0                  = noise drops with occupancy
+Anova(m_A)
+emtrends(m_A, ~ Site, var = "fracs_c")    
+plot(simulateResiduals(m_A))
+
+## Does the probability of a negative (noise-driven) estimate depend on
+## occupancy, and does that dependence differ by site?
+m_FP <- glmmTMB(neg ~ fracs_c * Site + (1 | SitePlot) + (1 | ASV),
+                family = binomial, data = bias_df)
+Anova(m_FP)
+## Key term: fracs_c:Site. A non-significant interaction means noise-driven positives scale with occupancy the same way at every site, so they add noise but should not shift site comparisons. Note: a Site main effect here is NOT clean evidence of bias, because sites can differ in true incorporation too.
+
+
+# S5C: Neither read depth nor occupancy predicts EAF, and neither
+#      differs in distribution among sites.
+
+## EAF ~ read depth (separately, because reads and occupancy covary - S5B)
+m_C1 <- glmmTMB(EAF ~ log_reads_c * Site + (1 | SitePlot) + (1 | ASV),
+                family = gaussian, data = bias_df)
+Anova(m_C1)
+emtrends(m_C1, ~ Site, var = "log_reads_c")
+
+## C2. Both predictors together; check collinearity before interpreting
+m_C2 <- glmmTMB(EAF ~ log_reads_c + fracs_c + Site + (1 | SitePlot) + (1 | ASV),
+                family = gaussian, data = bias_df)
+Anova(m_C2)
+performance::check_collinearity(m_C2)
+
+## C3. Do read depth and occupancy distributions differ among sites?
+m_C3_reads <- glmmTMB(log_reads ~ Site + (1 | SitePlot) + (1 | ASV),
+                      data = bias_df)
+m_C3_fracs <- glmmTMB(cbind(fracs, n_frac - fracs) ~ Site + (1 | SitePlot) + (1 | ASV),
+                      family = betabinomial, data = bias_df)
+Anova(m_C3_reads)
+Anova(m_C3_fracs)
+pairs(emmeans(m_C3_reads, ~ Site))
+
+
+# Sensitivity analysis: rerun the site-level incorporator comparison at stricter thresholds and: show the site pattern holds. 
+
+sens_tab <- do.call(rbind, lapply(1:3, function(k) {
+  d <- subset(bias_df, t4 >= k & t5 >= k)
+  m <- glmmTMB(pos ~ Site + (1 | SitePlot) + (1 | ASV),
+               family = binomial, data = d)
+  e <- as.data.frame(emmeans(m, ~ Site, type = "response"))
+  e$threshold <- k
+  e$n_occurrences <- nrow(d)
+  e
+}))
+sens_tab
+```
+#### Conclusion: Same site ranking and overlapping effect sizes across thresholds -> the permissive threshold did not change the site-level conclusion.
+
+
+# Step 11 generate a plot to show density shift for DNA
+```{r plot_density_shift, warming=FALSE}
+md_prop <- md[md$Hour != "t0", ]
+md_prop$prop_copies <- ave(md_prop$copies.ul, md_prop$incubation, 
+                           FUN = function(x) x / sum(x, na.rm = TRUE))
+# ggplot(md_prop, aes(x = Density, y = prop_copies, color = Isotope, group = incubation)) +
+#   geom_point(alpha = 0.5) + geom_line() +
+#   theme_bw() + facet_wrap(facets = "replicate", nrow = 3, ncol = 4) +
+#   labs(x = "Density Fraction", y = "Proportional 16S gene copies")
+ggplot(md_prop, aes(x = Density, y = prop_copies, color = Isotope, group = Isotope)) +
+   geom_point(alpha=0.5) + geom_smooth(method = "loess", se=0) +
+  theme_bw() +  
+  labs(x = "Density Fraction", y = "Proportional 16S gene copies") + 
+  ggtitle("Density shift in 15N-labeled DNA")
+```
+
+# Step 12 clean and save data
+## here i also make presence/absence datasets for non-incorporator taxa with all the fractions merged. 
+```{r data_wrangle_again, warning=FALSE}
+rm(agg,ft.1,ft.2,ft.3a,ft.3b,ft.3c, ft.eaf,ft.eaf.n,ft.eaf.n2,ft.Mlabmax,ft.Mlight,ft.tss, ft.tss.m, ft.Zi,nz,summary.table, summary.table2, valid_list, col_vals,EAF,fraction,Gi,i,idx,j,keep,lab, light,Mlab,Mlabmax,Mlight,rn,sp, taxa, these_incs, unique.sample, unique.tube, valid_asv, Wlab, Wlight, Zi,meta,ft1_long,eaf_long,density_plot,keep_md,p1,p2,df,df2,md_prop,summary.table3,rng)
+
+rm(avg_reads, avg_rel_abund, ft.t.m, plot_df, plot_df3, plot_df4)
+
+#. we need to clean the taxa tables of ambiguous names
+#sort(unique(tt$Genus))
+tt[tt$Genus =="uncultured",]$Genus <- "Unassigned"
+tt$Genus.unique <- paste(tt$Phylum, tt$Class, tt$Order, tt$Family, tt$Genus, sep=";")
+tt.t <- tt[row.names(tt)%in%row.names(ft.t),]
+
+## 1) Collapse columns by ID (part before "_")
+id <- sub("_.*$", "", colnames(ft.t))# Vector of IDs (everything before the first underscore)
+u.id <- unique(id)# Unique IDs (these will become the new column names)
+ft.combined <- sapply(u.id, function(x) {# For each unique ID, sum the corresponding columns by row
+  rowSums(ft.t[, id == x, drop = FALSE], na.rm = TRUE)
+}) 
+ft.combined <- as.data.frame(ft.combined) # Make sure it's a data.frame and keep rownames
+rownames(ft.combined) <- rownames(ft.t)
+## 2) Convert to presence/absence (1 = present, 0 = absent, keep NAs)
+ft.pa <- ifelse(ft.combined > 0, 1L, 0L) # keep NAs where original combined values were NA
+ft.pa[is.na(ft.combined)] <- NA
+ft.pa <- as.data.frame(ft.pa)
+rownames(ft.pa) <- rownames(ft.combined)
+ft.t.pa <- ft.pa
+rm(id, u.id, ft.combined, ft.pa)
+
+
+## save data
+#save.image("~/Documents/Projects/nspiral_nsip/RData/homebrew_output_dec2025.RData") # min-max scale
+#save.image("~/Documents/Projects/nspiral_nsip/RData/homebrew_output_may2026_t1.RData") # 877 taxa, threshold = 1
+#save.image("~/Documents/Projects/nspiral_nsip/RData/homebrew_output_may2026_t2.RData") # 333 taxa, threshold = 2
+#save.image("~/Documents/Projects/nspiral_nsip/RData/homebrew_output_may2026_t3.RData") # 151 taxa, threshold = 2
+
+#. ft               = un-normalized feature table made from LULU-merged ASVs
+#. ft.t             = un-normalized feature table that has been trimmed of low-abundance reads and contaminants, made from LULU-merged ASVs
+#. ft.t.inc         = incorporators with EAF value
+#. ft.t.pa          = presence absence of all taxa 
+#. ft.Mlab          = observed labeled molecular weight of the DNA sequence of each taxa
+#. md               = sample metadata which includes qPCR
+#. Sdat             = additional data about soil sampling, for N assimilated calculations
+#. tree             = phylogenetic tree matching ft 
+#. tt               = taxatable matching ft, SILVA 138
+#. tt.t             = taxatable matching ft.t, SILVA 138
+
+
+```
+
+
+
+
